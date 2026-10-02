@@ -28,15 +28,13 @@ on:
 permissions: {} # none
 
 concurrency:
-  # if this is a PR event, group = "pr-<number>", otherwise group = run_id so it never collides with other runs
   group: ${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || github.run_id }}
-  # only cancel in-progress when it’s a PR
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   build:
     permissions:
-      contents: read # actions/upload-artifact doesn't need contents: write
+      contents: read
     runs-on: ubuntu-24.04
     strategy:
       matrix:
@@ -138,12 +136,21 @@ jobs:
             done<<<${CHANGED_FILES}
           done
         else
-          # Ensure MANUAL_INPUT_PACKAGES is newline free, and put it
-          # into an array
+          # Manual dispatch: parse the space/newline-separated list.
+          # Each name may be a main package OR a subpackage. Subpackages are
+          # mapped back to their parent package. Unknown names are skipped
+          # with a warning instead of failing the whole run.
           read -a PACKAGES <<< "${MANUAL_INPUT_PACKAGES//$'\n'/ }"
+          repo_paths=$(jq --raw-output 'del(.pkg_format) | keys | .[]' repo.json)
+
+          declare -a resolved=()
+          declare -a missing=()
+
           for pkg in "${PACKAGES[@]}"; do
-            repo_paths=$(jq --raw-output 'del(.pkg_format) | keys | .[]' repo.json)
+            [ -z "$pkg" ] && continue
             found=false
+
+            # 1. Try as a main package directory
             for repo_path in $repo_paths; do
               repo=$(jq --raw-output '.["'${repo_path}'"].name' repo.json)
               if [ -d "${repo_path}/${pkg}" ]; then
@@ -152,13 +159,46 @@ jobs:
                 for subpkg in $(find "${repo_path}/${pkg}/" -maxdepth 1 -type f -name \*.subpackage.sh | sort); do
                   echo "$(basename "${subpkg%%.subpackage.sh}")" >> ./built_${repo}_subpackages.txt
                 done
+                resolved+=("$pkg")
+                break
               fi
             done
-            if [ "$found" != true ]; then
-              echo "Package '${pkg}' not found in any of the repo"
-              exit 1
-            fi
+            [ "$found" = true ] && continue
+
+            # 2. Try as a subpackage: search every repo's top-level packages
+            #    for a matching <name>.subpackage.sh
+            for repo_path in $repo_paths; do
+              repo=$(jq --raw-output '.["'${repo_path}'"].name' repo.json)
+              subfile=$(find "${repo_path}" -mindepth 2 -maxdepth 2 -type f \
+                          -name "${pkg}.subpackage.sh" -print -quit 2>/dev/null || true)
+              if [ -n "$subfile" ]; then
+                parent=$(basename "$(dirname "$subfile")")
+                echo ">>> '${pkg}' is a subpackage of '${parent}' — building '${parent}' instead"
+                found=true
+                echo "$parent" >> ./built_${repo}_packages.txt
+                for s in $(find "${repo_path}/${parent}/" -maxdepth 1 -type f -name \*.subpackage.sh | sort); do
+                  echo "$(basename "${s%%.subpackage.sh}")" >> ./built_${repo}_subpackages.txt
+                done
+                resolved+=("$pkg -> $parent")
+                break
+              fi
+            done
+            [ "$found" = true ] && continue
+
+            # 3. Not found anywhere — record and continue
+            missing+=("$pkg")
+            echo "::warning::Package '${pkg}' not found in any repo or as a subpackage — skipping"
           done
+
+          echo ">>> resolved ${#resolved[@]} package(s): ${resolved[*]:-<none>}"
+          if [ "${#missing[@]}" -gt 0 ]; then
+            echo ">>> skipped ${#missing[@]} unknown name(s): ${missing[*]}"
+          fi
+
+          if [ "${#resolved[@]}" -eq 0 ]; then
+            echo "::error::None of the requested packages were found. Aborting."
+            exit 1
+          fi
         fi
 
         for repo in $(jq --raw-output 'del(.pkg_format) | .[].name' repo.json); do
@@ -297,22 +337,26 @@ jobs:
         # Files containing certain symbols (e.g. ":") will cause failure in actions/upload-artifact.
         # Archiving *.deb files in a tarball to avoid issues with uploading.
         tar cf artifacts/debs-${{ matrix.target_arch }}-${{ github.sha }}.tar debs
+
     - name: Checksums for built *.deb files
       if: always()
       run: |
         find debs -type f -name "*.deb" -exec sha256sum "{}" \; | sort -k2 | tee checksum-${{ matrix.target_arch }}-${{ github.sha }}.txt
+
     - name: Store checksums for built *.deb files
       if: always()
       uses: actions/upload-artifact@v6
       with:
         name: checksum-${{ matrix.target_arch }}-${{ github.sha }}
         path: checksum-${{ matrix.target_arch }}-${{ github.sha }}.txt
+
     - name: Store *.deb files
       if: always()
       uses: actions/upload-artifact@v6
       with:
         name: debs-${{ matrix.target_arch }}-${{ github.sha }}
         path: ./artifacts
+
     - name: AppArmor Logs
       if: always()
       run: |
@@ -471,3 +515,83 @@ jobs:
             fi
           fi
         done
+
+  # Create a GitHub Release with all built .deb files
+  release:
+    permissions:
+      contents: write            # required to create a release + tag
+    needs: build
+    # Only run on pushes to branches and manual runs — never on PRs
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-24.04
+    steps:
+    - name: Clone repository
+      uses: actions/checkout@v6
+      with:
+        fetch-depth: 1
+
+    - name: Download all artifacts
+      uses: actions/download-artifact@v7
+      with:
+        path: ./all-artifacts
+
+    - name: Extract .deb files from tarballs
+      run: |
+        set -euo pipefail
+        mkdir -p release-debs
+        shopt -s nullglob
+
+        found=0
+        for archive in all-artifacts/debs-*/debs-*.tar; do
+          echo ">>> extracting $archive"
+          tar xf "$archive" -C release-debs
+          found=1
+        done
+
+        if [ "$found" -eq 0 ]; then
+          echo "::error::No debs-*.tar artifacts were found to release."
+          exit 1
+        fi
+
+        # The tarballs contain a top-level `debs/` directory; after extraction
+        # all architectures are merged into release-debs/debs/*.deb
+        count=$(find release-debs -type f -name '*.deb' | wc -l)
+        echo ">>> found ${count} .deb files"
+        if [ "$count" -eq 0 ]; then
+          echo "::error::No .deb files inside the artifacts — nothing to release."
+          exit 1
+        fi
+
+        # Show what we're about to publish
+        find release-debs -type f -name '*.deb' -printf '%f\n' | sort | head -50
+
+    - name: Compute release tag
+      id: tag
+      run: |
+        # Example: 2026.10.02-054930
+        TAG="$(date -u +'%Y.%m.%d-%H%M%S')"
+        echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+        echo ">>> release tag: ${TAG}"
+
+    - name: Create GitHub Release
+      uses: softprops/action-gh-release@v2
+      with:
+        tag_name: ${{ steps.tag.outputs.tag }}
+        name: Build ${{ steps.tag.outputs.tag }}
+        body: |
+          Automated package build.
+
+          - **Commit:** `${{ github.sha }}`
+          - **Branch:** `${{ github.ref_name }}`
+          - **Run:** ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          - **Architectures:** aarch64, arm, i686, x86_64
+          - **Packages:** `.deb` files are grouped by architecture suffix in the filename.
+        # Only the newly built .deb files
+        files: release-debs/debs/*.deb
+        fail_on_unmatched_files: true
+        generate_release_notes: false
+        draft: false
+        prerelease: false
+      env:
+        # GITHUB_TOKEN is enough to create a release; no workflow scope needed
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
