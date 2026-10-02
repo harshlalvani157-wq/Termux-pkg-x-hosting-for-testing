@@ -17,6 +17,9 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+      # -------------------------------------------------------------------
+      # 1. Checkout with PAT (falls back to built-in token)
+      # -------------------------------------------------------------------
       - name: Checkout
         uses: actions/checkout@v4
         with:
@@ -24,6 +27,9 @@ jobs:
           fetch-depth: 0
           token: ${{ secrets.GH_PUSH_TOKEN || secrets.GITHUB_TOKEN }}
 
+      # -------------------------------------------------------------------
+      # 2. Configure git identity + remote with token inline
+      # -------------------------------------------------------------------
       - name: Configure git for pushing
         run: |
           set -euo pipefail
@@ -32,64 +38,37 @@ jobs:
           git remote set-url origin \
             "https://x-access-token:${{ secrets.GH_PUSH_TOKEN || secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}"
 
-      # ---------------------------------------------------------------
-      # Fetch upstream and REPORT what's actually pending
-      # ---------------------------------------------------------------
-      - name: Fetch upstream
+      # -------------------------------------------------------------------
+      # 3. Merge upstream. Plain merge — keeps our custom packages
+      #    automatically (new files survive a merge untouched).
+      # -------------------------------------------------------------------
+      - name: Merge upstream
         run: |
           set -euo pipefail
+
           git remote add upstream https://github.com/termux/termux-packages.git 2>/dev/null || \
             git remote set-url upstream https://github.com/termux/termux-packages.git
+
           git fetch upstream master
-
-          echo ">>> upstream HEAD: $(git rev-parse --short upstream/master) $(git log -1 --format=%s upstream/master)"
-          echo ">>> local    HEAD: $(git rev-parse --short HEAD) $(git log -1 --format=%s HEAD)"
-          PENDING=$(git rev-list --count HEAD..upstream/master)
-          echo ">>> commits upstream has that we don't: ${PENDING}"
-          if [ "${PENDING}" -eq 0 ]; then
-            echo ">>> Nothing to merge — upstream is unchanged since last sync."
-          fi
-          git log --oneline HEAD..upstream/master | head -20
-
-      # ---------------------------------------------------------------
-      # Merge. No -X ours. gitattributes decides per-path.
-      # ---------------------------------------------------------------
-      - name: Merge upstream
-        id: merge
-        run: |
-          set -euo pipefail
           git checkout master
 
           if git merge upstream/master --no-edit -m "chore: sync with upstream"; then
             echo ">>> clean merge"
-            echo "conflicts=0" >> "$GITHUB_OUTPUT"
           else
-            echo ">>> conflicts on:"
-            git diff --name-only --diff-filter=U | tee /tmp/conflicts.txt
-            # For anything not protected by .gitattributes, take upstream.
-            # Protected paths (.github/**) already resolved as "ours".
+            echo ">>> conflicts, resolving: keep ours for .github, take upstream elsewhere"
             for f in $(git diff --name-only --diff-filter=U); do
               case "$f" in
-                .github/*)  git checkout --ours   -- "$f" ;;
-                *)          git checkout --theirs -- "$f" ;;
+                .github/*) git checkout --ours   -- "$f" ;;
+                *)         git checkout --theirs -- "$f" ;;
               esac
             done
             git add -A
-            git commit -m "chore: resolve conflicts during upstream sync (upstream for shared files)"
-            echo "conflicts=1" >> "$GITHUB_OUTPUT"
+            git commit -m "chore: resolve conflicts during upstream sync"
           fi
 
-      # ---------------------------------------------------------------
-      # Sanity: show how much the tree moved
-      # ---------------------------------------------------------------
-      - name: Diff summary
-        run: |
-          echo ">>> files changed since before this run:"
-          git diff --stat 'HEAD@{1}'..HEAD | tail -40 || true
-
-      # ---------------------------------------------------------------
-      # Force push
-      # ---------------------------------------------------------------
+      # -------------------------------------------------------------------
+      # 4. Force push
+      # -------------------------------------------------------------------
       - name: Push
         run: |
           set -euo pipefail
