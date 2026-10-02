@@ -8,14 +8,15 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
 jobs:
   sync-upstream:
     runs-on: ubuntu-latest
 
     steps:
-      # -------------------------------------------------------------------
-      # 1. Checkout with PAT (falls back to built-in token)
-      # -------------------------------------------------------------------
       - name: Checkout
         uses: actions/checkout@v4
         with:
@@ -23,9 +24,6 @@ jobs:
           fetch-depth: 0
           token: ${{ secrets.GH_PUSH_TOKEN || secrets.GITHUB_TOKEN }}
 
-      # -------------------------------------------------------------------
-      # 2. Set git identity + configure remote with token inline
-      # -------------------------------------------------------------------
       - name: Configure git for pushing
         run: |
           set -euo pipefail
@@ -33,60 +31,66 @@ jobs:
           git config --local user.name  "github-actions"
           git remote set-url origin \
             "https://x-access-token:${{ secrets.GH_PUSH_TOKEN || secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}"
-          git remote -v
-          git --no-pager log -1 --oneline
 
-      # -------------------------------------------------------------------
-      # 3. Fetch + merge upstream, resolving conflicts in favor of local
-      # -------------------------------------------------------------------
-      - name: Sync with upstream
+      # ---------------------------------------------------------------
+      # Fetch upstream and REPORT what's actually pending
+      # ---------------------------------------------------------------
+      - name: Fetch upstream
         run: |
           set -euo pipefail
-
           git remote add upstream https://github.com/termux/termux-packages.git 2>/dev/null || \
             git remote set-url upstream https://github.com/termux/termux-packages.git
-
           git fetch upstream master
 
-          # Keep our local workflow files no matter what upstream does
-          git checkout master
-
-          if ! git merge upstream/master --no-edit -m "Chore: sync with upstream termux-packages" -X ours; then
-            echo ">>> Merge conflict, resolving in favor of local..."
-            git checkout --ours -- .
-            git add -A
-            git commit -m "Chore: resolved merge conflicts during upstream sync" || true
+          echo ">>> upstream HEAD: $(git rev-parse --short upstream/master) $(git log -1 --format=%s upstream/master)"
+          echo ">>> local    HEAD: $(git rev-parse --short HEAD) $(git log -1 --format=%s HEAD)"
+          PENDING=$(git rev-list --count HEAD..upstream/master)
+          echo ">>> commits upstream has that we don't: ${PENDING}"
+          if [ "${PENDING}" -eq 0 ]; then
+            echo ">>> Nothing to merge — upstream is unchanged since last sync."
           fi
+          git log --oneline HEAD..upstream/master | head -20
 
-          # Belt-and-braces: never let upstream clobber our workflows
-          git checkout HEAD -- .github/workflows/ 2>/dev/null || true
-
-      # -------------------------------------------------------------------
-      # 4. Commit (if anything) + force-push to master
-      # -------------------------------------------------------------------
-      - name: Commit and push
+      # ---------------------------------------------------------------
+      # Merge. No -X ours. gitattributes decides per-path.
+      # ---------------------------------------------------------------
+      - name: Merge upstream
+        id: merge
         run: |
           set -euo pipefail
+          git checkout master
 
-          git add -A
-
-          if ! git diff --cached --quiet; then
-            git commit -m "ci: sync $(date -u +%Y%m%d-%H%M%S)"
+          if git merge upstream/master --no-edit -m "chore: sync with upstream"; then
+            echo ">>> clean merge"
+            echo "conflicts=0" >> "$GITHUB_OUTPUT"
           else
-            echo ">>> Nothing extra to commit."
+            echo ">>> conflicts on:"
+            git diff --name-only --diff-filter=U | tee /tmp/conflicts.txt
+            # For anything not protected by .gitattributes, take upstream.
+            # Protected paths (.github/**) already resolved as "ours".
+            for f in $(git diff --name-only --diff-filter=U); do
+              case "$f" in
+                .github/*)  git checkout --ours   -- "$f" ;;
+                *)          git checkout --theirs -- "$f" ;;
+              esac
+            done
+            git add -A
+            git commit -m "chore: resolve conflicts during upstream sync (upstream for shared files)"
+            echo "conflicts=1" >> "$GITHUB_OUTPUT"
           fi
 
-          BRANCH="master"
-          echo ">>> force-pushing to branch: ${BRANCH}"
+      # ---------------------------------------------------------------
+      # Sanity: show how much the tree moved
+      # ---------------------------------------------------------------
+      - name: Diff summary
+        run: |
+          echo ">>> files changed since before this run:"
+          git diff --stat 'HEAD@{1}'..HEAD | tail -40 || true
 
-          # Retry loop in case of a race
-          for i in 1 2 3; do
-            if git push --force origin "HEAD:refs/heads/${BRANCH}"; then
-              echo "✔ pushed on attempt $i"
-              break
-            fi
-            echo "push attempt $i failed; retrying in 5s"
-            sleep 5
-          done
-
-          echo ">>> push succeeded"
+      # ---------------------------------------------------------------
+      # Force push
+      # ---------------------------------------------------------------
+      - name: Push
+        run: |
+          set -euo pipefail
+          git push --force-with-lease origin HEAD:refs/heads/master
