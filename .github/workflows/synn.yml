@@ -17,7 +17,6 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      # --- your pattern: checkout with PAT (falls back to built-in token) ---
       - name: Checkout
         uses: actions/checkout@v4
         with:
@@ -25,7 +24,6 @@ jobs:
           fetch-depth: 0
           token: ${{ secrets.GH_PUSH_TOKEN || secrets.GITHUB_TOKEN }}
 
-      # --- your pattern: git identity + remote with token inline ---
       - name: Configure git for pushing
         run: |
           set -euo pipefail
@@ -36,7 +34,6 @@ jobs:
           git remote -v
           git --no-pager log -1 --oneline
 
-      # --- merge upstream: keeps custom packages, protects workflows ---
       - name: Sync with upstream
         run: |
           set -euo pipefail
@@ -47,7 +44,10 @@ jobs:
           git fetch upstream master
           git checkout master
 
-          # merge everything except .github/workflows
+          # Save pre-merge SHA — that's what we'll restore workflows from
+          PRE_MERGE="$(git rev-parse HEAD)"
+          echo ">>> pre-merge HEAD = ${PRE_MERGE}"
+
           if git merge upstream/master --no-edit -m "chore: sync with upstream" -X theirs; then
             echo ">>> clean merge"
           else
@@ -57,34 +57,41 @@ jobs:
             git commit -m "chore: resolve conflicts during upstream sync" || true
           fi
 
-          # never let upstream touch our workflows
-          git checkout HEAD -- .github/workflows/ 2>/dev/null || true
+          # Restore workflows from BEFORE the merge — this is the actual fix
+          git checkout "${PRE_MERGE}" -- .github/workflows/
           git add -A
-          git diff --cached --quiet || git commit -m "chore: restore local workflow files"
+          if ! git diff --cached --quiet; then
+            git commit -m "chore: restore local workflow files"
+            echo ">>> committed workflow restore"
+          else
+            echo ">>> workflows already match pre-merge state"
+          fi
 
-      # --- your pattern: commit + force push ---
       - name: Commit and push
         run: |
           set -euo pipefail
 
           git add -A
-
-          if git diff --cached --quiet; then
-            echo ">>> Nothing to commit."
-          else
+          if ! git diff --cached --quiet; then
             git commit -m "ci: sync $(date -u +%Y%m%d-%H%M%S)"
           fi
 
           BRANCH="master"
           echo ">>> force-pushing to branch: ${BRANCH}"
 
+          pushed=0
           for i in 1 2 3; do
             if git push --force origin "HEAD:refs/heads/${BRANCH}"; then
               echo "✔ pushed on attempt $i"
+              pushed=1
               break
             fi
             echo "push attempt $i failed; retrying in 5s"
             sleep 5
           done
 
+          if [ "${pushed}" -ne 1 ]; then
+            echo "::error::push failed after 3 attempts"
+            exit 1
+          fi
           echo ">>> push succeeded"
