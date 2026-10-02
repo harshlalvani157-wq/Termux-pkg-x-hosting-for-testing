@@ -17,23 +17,28 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+      # -------------------------------------------------------------------
+      # 1. Checkout repository
+      # -------------------------------------------------------------------
       - name: Checkout
         uses: actions/checkout@v4
         with:
           ref: master
           fetch-depth: 0
-          token: ${{ secrets.GH_PUSH_TOKEN || secrets.GITHUB_TOKEN }}
+          token: ${{ secrets.GH_PUSH_TOKEN }}
 
-      - name: Configure git for pushing
+      # -------------------------------------------------------------------
+      # 2. Configure Git identity
+      # -------------------------------------------------------------------
+      - name: Configure git
         run: |
           set -euo pipefail
           git config --local user.email "github-actions@users.noreply.github.com"
           git config --local user.name  "github-actions"
-          git remote set-url origin \
-            "https://x-access-token:${{ secrets.GH_PUSH_TOKEN || secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}"
-          git remote -v
-          git --no-pager log -1 --oneline
 
+      # -------------------------------------------------------------------
+      # 3. Fetch and Merge Upstream
+      # -------------------------------------------------------------------
       - name: Sync with upstream
         run: |
           set -euo pipefail
@@ -44,29 +49,33 @@ jobs:
           git fetch upstream master
           git checkout master
 
-          # Save pre-merge SHA — that's what we'll restore workflows from
+          # Save pre-merge SHA to restore our workflows later
           PRE_MERGE="$(git rev-parse HEAD)"
           echo ">>> pre-merge HEAD = ${PRE_MERGE}"
 
+          # Merge. `-X theirs` takes upstream for shared files, keeps our new packages.
           if git merge upstream/master --no-edit -m "chore: sync with upstream" -X theirs; then
             echo ">>> clean merge"
           else
-            echo ">>> conflicts — taking upstream for shared files"
+            echo ">>> conflicts — resolving"
             git checkout --theirs -- . 2>/dev/null || true
             git add -A
             git commit -m "chore: resolve conflicts during upstream sync" || true
           fi
 
-          # Restore workflows from BEFORE the merge — this is the actual fix
+          # IMPORTANT: Restore local workflow files from BEFORE the merge
           git checkout "${PRE_MERGE}" -- .github/workflows/
-          git add -A
+          
           if ! git diff --cached --quiet; then
-            git commit -m "chore: restore local workflow files"
+            git commit -m "chore: preserve local workflow files"
             echo ">>> committed workflow restore"
           else
-            echo ">>> workflows already match pre-merge state"
+            echo ">>> workflows unchanged"
           fi
 
+      # -------------------------------------------------------------------
+      # 4. Commit and Force Push (No fallback token!)
+      # -------------------------------------------------------------------
       - name: Commit and push
         run: |
           set -euo pipefail
@@ -76,9 +85,11 @@ jobs:
             git commit -m "ci: sync $(date -u +%Y%m%d-%H%M%S)"
           fi
 
-          BRANCH="master"
-          echo ">>> force-pushing to branch: ${BRANCH}"
+          # Force the use of GH_PUSH_TOKEN. If it's empty, this will fail loudly.
+          git remote set-url origin \
+            "https://x-access-token:${{ secrets.GH_PUSH_TOKEN }}@github.com/${{ github.repository }}"
 
+          BRANCH="master"
           pushed=0
           for i in 1 2 3; do
             if git push --force origin "HEAD:refs/heads/${BRANCH}"; then
