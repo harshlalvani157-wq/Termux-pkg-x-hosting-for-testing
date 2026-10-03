@@ -17,28 +17,19 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      # -------------------------------------------------------------------
-      # 1. Checkout repository
-      # -------------------------------------------------------------------
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
         with:
           ref: master
           fetch-depth: 0
           token: ${{ secrets.GH_PUSH_TOKEN }}
 
-      # -------------------------------------------------------------------
-      # 2. Configure Git identity
-      # -------------------------------------------------------------------
       - name: Configure git
         run: |
           set -euo pipefail
           git config --local user.email "github-actions@users.noreply.github.com"
           git config --local user.name  "github-actions"
 
-      # -------------------------------------------------------------------
-      # 3. Fetch and Merge Upstream
-      # -------------------------------------------------------------------
       - name: Sync with upstream
         run: |
           set -euo pipefail
@@ -49,50 +40,67 @@ jobs:
           git fetch upstream master
           git checkout master
 
-          # Save pre-merge SHA to restore our workflows later
-          PRE_MERGE="$(git rev-parse HEAD)"
-          echo ">>> pre-merge HEAD = ${PRE_MERGE}"
+          # ------------------------------------------------------------------
+          # 1. Snapshot the paths we want to keep OUR version of, no matter
+          #    what upstream does. Right now that's just the workflow files.
+          #    Add more paths here if you have other files you edit locally
+          #    and never want overwritten.
+          # ------------------------------------------------------------------
+          KEEP_PATHS=(".github/workflows")
+          mkdir -p /tmp/keep
+          for p in "${KEEP_PATHS[@]}"; do
+            dest="/tmp/keep/${p//\//__}"
+            rm -rf "$dest"
+            if [ -e "$p" ]; then
+              cp -r "$p" "$dest"
+            fi
+          done
 
-          # Merge. `-X theirs` takes upstream for shared files, keeps our new packages.
-          if git merge upstream/master --no-edit -m "chore: sync with upstream" -X theirs; then
-            echo ">>> clean merge"
+          # ------------------------------------------------------------------
+          # 2. Reset every tracked file to upstream's version.
+          #    - Files shared with upstream  → upstream wins (this is the fix)
+          #    - Files only in our repo       → untouched (kept as-is)
+          #    - Files we deleted but up      → recreated from upstream
+          #      stream still has
+          # ------------------------------------------------------------------
+          git checkout upstream/master -- .
+
+          # ------------------------------------------------------------------
+          # 3. Restore the paths we explicitly protected.
+          # ------------------------------------------------------------------
+          for p in "${KEEP_PATHS[@]}"; do
+            src="/tmp/keep/${p//\//__}"
+            if [ -e "$src" ]; then
+              rm -rf "$p"
+              mkdir -p "$(dirname "$p")"
+              cp -r "$src" "$p"
+            fi
+          done
+
+          # ------------------------------------------------------------------
+          # 4. Show what actually changed (nice for the run log).
+          # ------------------------------------------------------------------
+          echo ">>> changes staged for this sync:"
+          git add -A
+          git diff --cached --stat | tail -30 || true
+
+          if git diff --cached --quiet; then
+            echo ">>> No changes — already up to date with upstream."
           else
-            echo ">>> conflicts — resolving"
-            git checkout --theirs -- . 2>/dev/null || true
-            git add -A
-            git commit -m "chore: resolve conflicts during upstream sync" || true
+            git commit -m "chore: sync with upstream $(date -u +%Y%m%d-%H%M%S)"
+            echo ">>> committed sync"
           fi
 
-          # IMPORTANT: Restore local workflow files from BEFORE the merge
-          git checkout "${PRE_MERGE}" -- .github/workflows/
-          
-          if ! git diff --cached --quiet; then
-            git commit -m "chore: preserve local workflow files"
-            echo ">>> committed workflow restore"
-          else
-            echo ">>> workflows unchanged"
-          fi
-
-      # -------------------------------------------------------------------
-      # 4. Commit and Force Push (No fallback token!)
-      # -------------------------------------------------------------------
-      - name: Commit and push
+      - name: Push
         run: |
           set -euo pipefail
 
-          git add -A
-          if ! git diff --cached --quiet; then
-            git commit -m "ci: sync $(date -u +%Y%m%d-%H%M%S)"
-          fi
-
-          # Force the use of GH_PUSH_TOKEN. If it's empty, this will fail loudly.
           git remote set-url origin \
             "https://x-access-token:${{ secrets.GH_PUSH_TOKEN }}@github.com/${{ github.repository }}"
 
-          BRANCH="master"
           pushed=0
           for i in 1 2 3; do
-            if git push --force origin "HEAD:refs/heads/${BRANCH}"; then
+            if git push --force origin "HEAD:refs/heads/master"; then
               echo "✔ pushed on attempt $i"
               pushed=1
               break
