@@ -1,0 +1,135 @@
+name: Generate APT Repository
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-indexes:
+    # Don't re-run when this workflow itself publishes the "packages" release
+    if: github.event_name != 'release' || github.event.release.tag_name != 'packages'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y dpkg-dev apt-utils
+
+      - name: Download all release .deb assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          mkdir -p repo-build
+          cd repo-build
+
+          # --paginate so we don't miss releases beyond page 1
+          mapfile -t TAGS < <(
+            gh api --paginate "repos/${{ github.repository }}/releases" \
+              --jq '.[] | select(.tag_name != "packages") | .tag_name'
+          )
+
+          if [ "${#TAGS[@]}" -eq 0 ]; then
+            echo "No releases to process."
+            exit 0
+          fi
+
+          for tag in "${TAGS[@]}"; do
+            mkdir -p "$tag"
+            echo ">>> downloading .deb files from release $tag"
+            gh release download "$tag" \
+              -p "*.deb" \
+              -D "$tag" \
+              --repo "${{ github.repository }}" \
+              || echo "  (no .deb assets for $tag, skipping)"
+          done
+
+      - name: Generate Packages index
+        run: |
+          set -euo pipefail
+          cd repo-build
+
+          # dpkg-scanpackages does NOT recurse, so scan each tag dir and
+          # rewrite Filename to be relative to the 'packages' release:
+          #     Filename: ../<tag>/foo.deb
+          : > Packages
+          for dir in */; do
+            tag="${dir%/}"
+            [ -d "$tag" ] || continue
+            # Only scan if there's at least one .deb
+            shopt -s nullglob
+            debs=("$tag"/*.deb)
+            shopt -u nullglob
+            [ "${#debs[@]}" -eq 0 ] && continue
+
+            dpkg-scanpackages -m "$tag" /dev/null 2>/dev/null \
+              | sed -E "s|^Filename: |Filename: ../$tag/|" \
+              >> Packages
+          done
+
+          echo ">>> Packages file has $(grep -c '^Package:' Packages || true) entries"
+
+      - name: Generate Contents-aarch64
+        run: |
+          set -euo pipefail
+          cd repo-build
+
+          : > Contents-aarch64
+          find . -type f -name '*.deb' | while read -r deb; do
+            pkg_name=$(dpkg-deb -f "$deb" Package)
+            dpkg-deb -c "$deb" \
+              | awk -v pkg="$pkg_name" '$1 !~ /^d/ { sub(/^\.\//, "", $6); print $6 "\t" pkg }' \
+              >> Contents-aarch64
+          done
+
+          echo ">>> Contents-aarch64 has $(wc -l < Contents-aarch64) lines"
+
+      - name: Compress indexes
+        run: |
+          set -euo pipefail
+          cd repo-build
+          gzip -9c Packages         > Packages.gz
+          bzip2 -9c Packages        > Packages.bz2
+          gzip -9c Contents-aarch64 > Contents-aarch64.gz
+
+      - name: Generate Release metadata
+        run: |
+          set -euo pipefail
+          cd repo-build
+
+          cat > apt-ftparchive.conf <<'EOF'
+          APT::FTPArchive::Release::Origin "Termux-pkg-x";
+          APT::FTPArchive::Release::Label "Termux-pkg-x";
+          APT::FTPArchive::Release::Suite "stable";
+          APT::FTPArchive::Release::Codename "stable";
+          APT::FTPArchive::Release::Architectures "aarch64";
+          APT::FTPArchive::Release::Components "main";
+          EOF
+
+          apt-ftparchive -c apt-ftparchive.conf release . > Release
+
+      - name: Upload and overwrite to 'packages' release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          cd repo-build
+
+          if ! gh release view packages --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            gh release create packages \
+              --title "APT Indexes" \
+              --notes "Auto-generated repository indexes. Do not edit manually." \
+              --repo "${{ github.repository }}"
+          fi
+
+          gh release upload packages \
+            Packages Packages.gz Packages.bz2 \
+            Contents-aarch64 Contents-aarch64.gz \
+            Release \
+            --clobber \
+            --repo "${{ github.repository }}"
