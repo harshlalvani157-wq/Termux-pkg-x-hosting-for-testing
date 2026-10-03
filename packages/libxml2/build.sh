@@ -17,7 +17,7 @@ TERMUX_PKG_SETUP_PYTHON=true
 #	-Dthread-alloc=enabled
 #	-Dtls=enabled
 TERMUX_PKG_EXTRA_CONFIGURE_ARGS="
-	-Ddocs=disabled
+	-Ddocs=enabled
 	-Dhttp=enabled
 	-Dlegacy=enabled
 "
