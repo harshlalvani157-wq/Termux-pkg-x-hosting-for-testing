@@ -6,7 +6,6 @@ TERMUX_PKG_VERSION="2.8.1"
 TERMUX_PKG_REVISION=2
 TERMUX_PKG_SRCURL=https://salsa.debian.org/apt-team/apt/-/archive/${TERMUX_PKG_VERSION}/apt-${TERMUX_PKG_VERSION}.tar.bz2
 TERMUX_PKG_SHA256=87ca18392c10822a133b738118505f7d04e0b31ba1122bf5d32911311cb2dc7e
-# REMOVED gpgv and termux-keyring for unauthenticated GitHub Releases
 TERMUX_PKG_DEPENDS="coreutils, dpkg, findutils, grep, libandroid-glob, libbz2, libc++, libiconv, libgcrypt, libgnutls, liblz4, liblzma, sed, termux-licenses, xxhash, zlib, zstd"
 TERMUX_PKG_BUILD_DEPENDS="docbook-xsl,libdb"
 TERMUX_PKG_CONFLICTS="apt-transport-https, libapt-pkg, unstable-repo, game-repo, science-repo"
@@ -65,14 +64,13 @@ termux_step_post_make_install() {
 	mkdir -p $TERMUX_PREFIX/etc/apt/
 	{
 		echo "# app.xodos2 Flat GitHub Releases Repository"
-		# Notice the trailing slash and space before the slash. This tells apt it is a flat repository, not a "dists" repository.
 		echo "deb [trusted=yes] https://github.com/xodiosx/Termux-pkg-x/releases/download/packages /"
 	} > $TERMUX_PREFIX/etc/apt/sources.list
 
 	ln -sfr $TERMUX_PREFIX/lib/apt/methods/http $TERMUX_PREFIX/lib/apt/methods/tor
 	ln -sfr $TERMUX_PREFIX/lib/apt/methods/http $TERMUX_PREFIX/lib/apt/methods/tor+http
 	ln -sfr $TERMUX_PREFIX/lib/apt/methods/https $TERMUX_PREFIX/lib/apt/methods/tor+https
-	
+
 	local dir=$TERMUX_PREFIX/share/apt-transport-tor
 	mkdir -p $dir
 	touch $dir/.placeholder
