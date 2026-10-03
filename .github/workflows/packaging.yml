@@ -1,4 +1,4 @@
-name: release Packages
+name: releas Packages
 
 on:
   push:
@@ -517,7 +517,8 @@ jobs:
           fi
         done
 
-  # Create a GitHub Release with all built .deb files
+  # Create a GitHub Release with all built .deb files.
+  # Uses gh CLI with serialized uploads + retries to avoid GitHub's secondary rate limit.
   release:
     permissions:
       contents: write            # required to create a release + tag
@@ -525,6 +526,8 @@ jobs:
     # Only run on pushes to branches and manual runs — never on PRs
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-24.04
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
     - name: Clone repository
       uses: actions/checkout@v6
@@ -563,8 +566,8 @@ jobs:
           exit 1
         fi
 
-        # Show what we're about to publish
-        find release-debs -type f -name '*.deb' -printf '%f\n' | sort | head -50
+        echo ">>> sample of what will be published:"
+        find release-debs -type f -name '*.deb' -printf '%f\n' | sort | head -20
 
     - name: Compute release tag
       id: tag
@@ -574,25 +577,80 @@ jobs:
         echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
         echo ">>> release tag: ${TAG}"
 
-    - name: Create GitHub Release
-      uses: softprops/action-gh-release@v2
-      with:
-        tag_name: ${{ steps.tag.outputs.tag }}
-        name: Build ${{ steps.tag.outputs.tag }}
-        body: |
-          Automated package build.
+    - name: Create release
+      run: |
+        set -euo pipefail
+        gh release create "${{ steps.tag.outputs.tag }}" \
+          --title "Build ${{ steps.tag.outputs.tag }}" \
+          --notes "Automated package build.
 
-          - **Commit:** `${{ github.sha }}`
-          - **Branch:** `${{ github.ref_name }}`
-          - **Run:** ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-          - **Architectures:** aarch64, arm, i686, x86_64
-          - **Packages:** `.deb` files are grouped by architecture suffix in the filename.
-        # Only the newly built .deb files
-        files: release-debs/debs/*.deb
-        fail_on_unmatched_files: true
-        generate_release_notes: false
-        draft: false
-        prerelease: false
-      env:
-        # GITHUB_TOKEN is enough to create a release; no workflow scope needed
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        - **Commit:** \`${{ github.sha }}\`
+        - **Branch:** \`${{ github.ref_name }}\`
+        - **Run:** ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        - **Architectures:** aarch64, arm, i686, x86_64
+        - **Packages:** \`.deb\` files, grouped by architecture suffix." \
+          --target "${{ github.sha }}" \
+          || { echo "::error::Failed to create release"; exit 1; }
+
+    - name: Upload .deb files (serialized, with retries)
+      run: |
+        set -euo pipefail
+        TAG="${{ steps.tag.outputs.tag }}"
+
+        # Collect all debs into a stable order
+        mapfile -t FILES < <(find release-debs -type f -name '*.deb' | sort)
+        total="${#FILES[@]}"
+        echo ">>> uploading ${total} files serially"
+
+        i=0
+        failed=0
+        for f in "${FILES[@]}"; do
+          i=$((i + 1))
+          name="$(basename "$f")"
+          printf '[%d/%d] %s ... ' "$i" "$total" "$name"
+
+          ok=0
+          for attempt in 1 2 3 4 5; do
+            if gh release upload "$TAG" "$f" --clobber 2>/tmp/gh_err.log; then
+              ok=1
+              break
+            fi
+            # Detect secondary rate limit and back off hard
+            if grep -qiE 'secondary rate limit|abuse|rate limit' /tmp/gh_err.log; then
+              backoff=$((attempt * 15))
+              echo
+              echo "  ↳ rate limited, sleeping ${backoff}s (attempt ${attempt}/5)"
+              sleep "$backoff"
+            else
+              backoff=$((attempt * 3))
+              echo
+              echo "  ↳ upload failed, retrying in ${backoff}s (attempt ${attempt}/5)"
+              cat /tmp/gh_err.log || true
+              sleep "$backoff"
+            fi
+          done
+
+          if [ "$ok" -eq 1 ]; then
+            echo "ok"
+          else
+            echo "FAILED: $name"
+            failed=$((failed + 1))
+          fi
+
+          # Small steady delay between successful uploads to stay under rate limits
+          sleep 1
+        done
+
+        if [ "$failed" -gt 0 ]; then
+          echo "::error::${failed} of ${total} files failed to upload after 5 attempts"
+          exit 1
+        fi
+
+        echo ">>> all ${total} files uploaded successfully"
+
+    - name: Verify release assets
+      run: |
+        set -euo pipefail
+        TAG="${{ steps.tag.outputs.tag }}"
+        count=$(gh release view "$TAG" --json assets --jq '.assets | length')
+        echo ">>> release ${TAG} has ${count} assets"
