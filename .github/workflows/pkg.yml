@@ -10,7 +10,6 @@ permissions:
 
 jobs:
   build-indexes:
-    # Don't re-run when this workflow itself publishes the "packages" release
     if: github.event_name != 'release' || github.event.release.tag_name != 'packages'
     runs-on: ubuntu-latest
 
@@ -20,15 +19,16 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y dpkg-dev apt-utils
 
-      - name: Download all release .deb assets
+      - name: Download and consolidate all .deb packages
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          mkdir -p repo-build
+          mkdir -p repo-build/packages
           cd repo-build
 
-          # --paginate so we don't miss releases beyond page 1
+          # Newest-first by default from the API — so mv -n keeps the newest
+          # version of any duplicated filename.
           mapfile -t TAGS < <(
             gh api --paginate "repos/${{ github.repository }}/releases" \
               --jq '.[] | select(.tag_name != "packages") | .tag_name'
@@ -47,61 +47,43 @@ jobs:
               -D "$tag" \
               --repo "${{ github.repository }}" \
               || echo "  (no .deb assets for $tag, skipping)"
-          done
 
-      - name: Generate Packages index
-        run: |
-          set -euo pipefail
-          cd repo-build
-
-          # dpkg-scanpackages does NOT recurse, so scan each tag dir and
-          # rewrite Filename to be relative to the 'packages' release:
-          #     Filename: ../<tag>/foo.deb
-          : > Packages
-          for dir in */; do
-            tag="${dir%/}"
-            [ -d "$tag" ] || continue
-            # Only scan if there's at least one .deb
             shopt -s nullglob
             debs=("$tag"/*.deb)
             shopt -u nullglob
-            [ "${#debs[@]}" -eq 0 ] && continue
 
-            dpkg-scanpackages -m "$tag" /dev/null 2>/dev/null \
-              | sed -E "s|^Filename: |Filename: ../$tag/|" \
-              >> Packages
+            if [ "${#debs[@]}" -gt 0 ]; then
+              mv -n "$tag"/*.deb packages/
+            fi
+
+            rm -rf "$tag"
           done
 
-          echo ">>> Packages file has $(grep -c '^Package:' Packages || true) entries"
+          echo ">>> total .deb files staged: $(find packages -maxdepth 1 -name '*.deb' | wc -l)"
 
-      - name: Generate Contents-aarch64
+      - name: Generate APT Indexes
         run: |
           set -euo pipefail
-          cd repo-build
+          cd repo-build/packages
 
+          echo ">>> Generating Packages index..."
+          dpkg-scanpackages -m . > Packages
+
+          echo ">>> Generating Contents-aarch64..."
           : > Contents-aarch64
-          find . -type f -name '*.deb' | while read -r deb; do
+          find . -type f -name '*.deb' -print0 | sort -z | while IFS= read -r -d '' deb; do
             pkg_name=$(dpkg-deb -f "$deb" Package)
             dpkg-deb -c "$deb" \
               | awk -v pkg="$pkg_name" '$1 !~ /^d/ { sub(/^\.\//, "", $6); print $6 "\t" pkg }' \
               >> Contents-aarch64
           done
 
-          echo ">>> Contents-aarch64 has $(wc -l < Contents-aarch64) lines"
-
-      - name: Compress indexes
-        run: |
-          set -euo pipefail
-          cd repo-build
+          echo ">>> Compressing indexes..."
           gzip -9c Packages         > Packages.gz
           bzip2 -9c Packages        > Packages.bz2
           gzip -9c Contents-aarch64 > Contents-aarch64.gz
 
-      - name: Generate Release metadata
-        run: |
-          set -euo pipefail
-          cd repo-build
-
+          echo ">>> Generating Release metadata..."
           cat > apt-ftparchive.conf <<'EOF'
           APT::FTPArchive::Release::Origin "Termux-pkg-x";
           APT::FTPArchive::Release::Label "Termux-pkg-x";
@@ -113,23 +95,114 @@ jobs:
 
           apt-ftparchive -c apt-ftparchive.conf release . > Release
 
-      - name: Upload and overwrite to 'packages' release
+          echo ">>> indexes ready:"
+          ls -lh Packages Packages.gz Packages.bz2 Contents-aarch64 Contents-aarch64.gz Release
+
+      - name: Upload to 'packages' release (incremental, serialized, with retries)
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          cd repo-build
+          cd repo-build/packages
 
+          # --- Ensure the 'packages' release exists -----------------------------
           if ! gh release view packages --repo "${{ github.repository }}" >/dev/null 2>&1; then
             gh release create packages \
-              --title "APT Indexes" \
-              --notes "Auto-generated repository indexes. Do not edit manually." \
+              --title "Consolidated APT Repository" \
+              --notes "All packages and indexes. Use this release in sources.list." \
               --repo "${{ github.repository }}"
           fi
 
-          gh release upload packages \
-            Packages Packages.gz Packages.bz2 \
-            Contents-aarch64 Contents-aarch64.gz \
-            Release \
-            --clobber \
-            --repo "${{ github.repository }}"
+          # --- Build the set of already-uploaded assets -------------------------
+          # We only upload .debs that aren't already there. Index files are
+          # always re-uploaded because they change every run.
+          echo ">>> querying existing assets on 'packages'..."
+          gh release view packages \
+            --repo "${{ github.repository }}" \
+            --json assets \
+            --jq '.assets[].name' | sort > /tmp/existing-assets.txt
+          echo ">>> already present: $(wc -l < /tmp/existing-assets.txt) assets"
+
+          # --- Assemble the upload queue ----------------------------------------
+          # Index files: always upload.
+          # .debs: only those NOT already present.
+          : > /tmp/upload-queue.txt
+
+          for idx in Packages Packages.gz Packages.bz2 Contents-aarch64 Contents-aarch64.gz Release; do
+            [ -f "$idx" ] && echo "$idx" >> /tmp/upload-queue.txt
+          done
+
+          find . -maxdepth 1 -type f -name '*.deb' -printf '%f\n' | sort | while read -r name; do
+            if ! grep -qxF "$name" /tmp/existing-assets.txt; then
+              echo "$name" >> /tmp/upload-queue.txt
+            fi
+          done
+
+          total=$(wc -l < /tmp/upload-queue.txt)
+          echo ">>> files to upload this run: ${total}"
+
+          if [ "$total" -eq 0 ]; then
+            echo ">>> nothing new to upload"
+            exit 0
+          fi
+
+          # --- Serialized upload with retries -----------------------------------
+          failed=0
+          i=0
+          while IFS= read -r f; do
+            i=$((i + 1))
+            printf '[%d/%d] %s ... ' "$i" "$total" "$f"
+
+            ok=0
+            for attempt in 1 2 3 4 5; do
+              if gh release upload packages "$f" \
+                    --clobber \
+                    --repo "${{ github.repository }}" \
+                    2>/tmp/gh_err.log; then
+                ok=1
+                break
+              fi
+
+              if grep -qiE 'secondary rate limit|abuse|rate limit' /tmp/gh_err.log; then
+                backoff=$((attempt * 15))
+                echo
+                echo "  ↳ rate limited, sleeping ${backoff}s (attempt ${attempt}/5)"
+                sleep "$backoff"
+              else
+                backoff=$((attempt * 3))
+                echo
+                echo "  ↳ upload failed, retrying in ${backoff}s (attempt ${attempt}/5)"
+                cat /tmp/gh_err.log || true
+                sleep "$backoff"
+              fi
+            done
+
+            if [ "$ok" -eq 1 ]; then
+              echo "ok"
+            else
+              echo "FAILED: $f"
+              failed=$((failed + 1))
+            fi
+
+            # Steady delay to respect the primary rate limit (5000 req/hour).
+            # 1s keeps us at 3600 calls/hour, comfortably under the ceiling.
+            sleep 1
+          done < /tmp/upload-queue.txt
+
+          if [ "$failed" -gt 0 ]; then
+            echo "::error::${failed} of ${total} files failed to upload after 5 attempts"
+            exit 1
+          fi
+
+          echo ">>> all ${total} files uploaded successfully"
+
+      - name: Verify uploaded assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          echo ">>> asset count on 'packages' release:"
+          gh release view packages \
+            --repo "${{ github.repository }}" \
+            --json assets \
+            --jq '.assets | length'
