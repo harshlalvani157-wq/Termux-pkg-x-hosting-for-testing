@@ -32,6 +32,53 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  # -------------------------------------------------------------------
+  # Runs FIRST, before the build even starts. Creates (or reuses) the
+  # fixed-tag release so it exists while the build is still running.
+  # -------------------------------------------------------------------
+  prepare-release:
+    permissions:
+      contents: write
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-24.04
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+      timestamp: ${{ steps.tag.outputs.timestamp }}
+    steps:
+    - name: Compute release tag
+      id: tag
+      run: |
+        TAG="latest"
+        TS="$(date -u +'%Y.%m.%d-%H%M%S')"
+        echo "tag=${TAG}"       >> "$GITHUB_OUTPUT"
+        echo "timestamp=${TS}"  >> "$GITHUB_OUTPUT"
+        echo ">>> release tag: ${TAG}  (this run: ${TS})"
+
+    - name: Create release if missing
+      run: |
+        set -euo pipefail
+        TAG="${{ steps.tag.outputs.tag }}"
+
+        if gh release view "$TAG" >/dev/null 2>&1; then
+          echo ">>> release '$TAG' already exists — will overwrite its assets"
+        else
+          echo ">>> creating release '$TAG'"
+          gh release create "$TAG" \
+            --title "Build ${{ steps.tag.outputs.timestamp }}" \
+            --notes "Automated package build.
+
+        - **Last update:** ${{ steps.tag.outputs.timestamp }} UTC
+        - **Commit:** \`${{ github.sha }}\`
+        - **Branch:** \`${{ github.ref_name }}\`
+        - **Run:** ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        - **Architectures:** aarch64
+        - **Packages:** \`.deb\` files. This release is updated in-place on each successful build." \
+            --target "${{ github.sha }}" \
+            || { echo "::error::Failed to create release '$TAG'"; exit 1; }
+        fi
+
   build:
     permissions:
       contents: read
@@ -517,56 +564,34 @@ jobs:
           fi
         done
 
-  # Create a GitHub Release with all built .deb files.
-  # Uses gh CLI with serialized uploads + retries to avoid GitHub's secondary rate limit.
+  # -------------------------------------------------------------------
+  # Uploads artifacts into the release created by 'prepare-release'.
+  # Runs after the build finishes.
+  # -------------------------------------------------------------------
   release:
     permissions:
-      contents: write            # required to create a release + tag
-    needs: build
-    # Only run on pushes to branches and manual runs — never on PRs
+      contents: write
+    needs: [build, prepare-release]
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-24.04
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
-    # ------------------------------------------------------------------
-    # PREPARE: create the release up front so it exists before any of
-    # the artifact download/upload work below. Idempotent — if a prior
-    # attempt already made the tag, it is reused as-is.
-    # ------------------------------------------------------------------
-    - name: Compute release tag
-      id: tag
-      run: |
-        # Example: 2026.10.02-054930
-        TAG="$(date -u +'%Y.%m.%d-%H%M%S')"
-        echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
-        echo ">>> release tag: ${TAG}"
-
-    - name: Prepare release (create if missing)
+    - name: Update release notes (title + body with latest run info)
       run: |
         set -euo pipefail
-        TAG="${{ steps.tag.outputs.tag }}"
+        TAG="${{ needs.prepare-release.outputs.tag }}"
+        gh release edit "$TAG" \
+          --title "Build ${{ needs.prepare-release.outputs.timestamp }}" \
+          --notes "Automated package build.
 
-        if gh release view "$TAG" >/dev/null 2>&1; then
-          echo ">>> release '$TAG' already exists — reusing it"
-        else
-          echo ">>> creating release '$TAG'"
-          gh release create "$TAG" \
-            --title "Build $TAG" \
-            --notes "Automated package build.
-
+        - **Last update:** ${{ needs.prepare-release.outputs.timestamp }} UTC
         - **Commit:** \`${{ github.sha }}\`
         - **Branch:** \`${{ github.ref_name }}\`
         - **Run:** ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-        - **Architectures:** aarch64, arm, i686, x86_64
-        - **Packages:** \`.deb\` files, grouped by architecture suffix." \
-            --target "${{ github.sha }}" \
-            || { echo "::error::Failed to create release '$TAG'"; exit 1; }
-        fi
+        - **Architectures:** aarch64
+        - **Packages:** \`.deb\` files. This release is updated in-place on each successful build."
 
-    # ------------------------------------------------------------------
-    # Everything below is unchanged from the original script.
-    # ------------------------------------------------------------------
     - name: Clone repository
       uses: actions/checkout@v6
       with:
@@ -595,8 +620,6 @@ jobs:
           exit 1
         fi
 
-        # The tarballs contain a top-level `debs/` directory; after extraction
-        # all architectures are merged into release-debs/debs/*.deb
         count=$(find release-debs -type f -name '*.deb' | wc -l)
         echo ">>> found ${count} .deb files"
         if [ "$count" -eq 0 ]; then
@@ -610,12 +633,11 @@ jobs:
     - name: Upload .deb files (serialized, with retries)
       run: |
         set -euo pipefail
-        TAG="${{ steps.tag.outputs.tag }}"
+        TAG="${{ needs.prepare-release.outputs.tag }}"
 
-        # Collect all debs into a stable order
         mapfile -t FILES < <(find release-debs -type f -name '*.deb' | sort)
         total="${#FILES[@]}"
-        echo ">>> uploading ${total} files serially"
+        echo ">>> uploading ${total} files serially into release '${TAG}'"
 
         i=0
         failed=0
@@ -630,7 +652,6 @@ jobs:
               ok=1
               break
             fi
-            # Detect secondary rate limit and back off hard
             if grep -qiE 'secondary rate limit|abuse|rate limit' /tmp/gh_err.log; then
               backoff=$((attempt * 15))
               echo
@@ -652,7 +673,6 @@ jobs:
             failed=$((failed + 1))
           fi
 
-          # Small steady delay between successful uploads to stay under rate limits
           sleep 1
         done
 
@@ -666,6 +686,6 @@ jobs:
     - name: Verify release assets
       run: |
         set -euo pipefail
-        TAG="${{ steps.tag.outputs.tag }}"
+        TAG="${{ needs.prepare-release.outputs.tag }}"
         count=$(gh release view "$TAG" --json assets --jq '.assets | length')
         echo ">>> release ${TAG} has ${count} assets"
