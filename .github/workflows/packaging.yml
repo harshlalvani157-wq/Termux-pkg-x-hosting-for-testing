@@ -47,6 +47,13 @@ jobs:
       tag: ${{ steps.tag.outputs.tag }}
       timestamp: ${{ steps.tag.outputs.timestamp }}
     steps:
+    # gh release create needs a git repo on disk to determine the repo
+    # context, even when --target is passed. Shallow checkout is enough.
+    - name: Checkout (shallow)
+      uses: actions/checkout@v6
+      with:
+        fetch-depth: 1
+
     - name: Compute release tag
       id: tag
       run: |
@@ -620,6 +627,8 @@ jobs:
           exit 1
         fi
 
+        # The tarballs contain a top-level `debs/` directory; after extraction
+        # all architectures are merged into release-debs/debs/*.deb
         count=$(find release-debs -type f -name '*.deb' | wc -l)
         echo ">>> found ${count} .deb files"
         if [ "$count" -eq 0 ]; then
@@ -635,6 +644,7 @@ jobs:
         set -euo pipefail
         TAG="${{ needs.prepare-release.outputs.tag }}"
 
+        # Collect all debs into a stable order
         mapfile -t FILES < <(find release-debs -type f -name '*.deb' | sort)
         total="${#FILES[@]}"
         echo ">>> uploading ${total} files serially into release '${TAG}'"
@@ -652,6 +662,7 @@ jobs:
               ok=1
               break
             fi
+            # Detect secondary rate limit and back off hard
             if grep -qiE 'secondary rate limit|abuse|rate limit' /tmp/gh_err.log; then
               backoff=$((attempt * 15))
               echo
@@ -673,6 +684,7 @@ jobs:
             failed=$((failed + 1))
           fi
 
+          # Small steady delay between successful uploads to stay under rate limits
           sleep 1
         done
 
