@@ -2,30 +2,21 @@ name: releas Packages
 
 on:
   push:
-    branches:
-    - master
-    - dev
-    - 'dev/**'
-    paths:
-    - 'packages/**'
-    - 'root-packages/**'
-    - 'x11-packages/**'
+    branches: [master, dev, 'dev/**']
+    paths: ['packages/**', 'root-packages/**', 'x11-packages/**']
   pull_request:
-    paths:
-    - 'packages/**'
-    - 'root-packages/**'
-    - 'x11-packages/**'
+    paths: ['packages/**', 'root-packages/**', 'x11-packages/**']
   workflow_dispatch:
     inputs:
       packages:
         description: "A space-separated names of packages selected for rebuilding"
         required: true
       free-space:
-        description: "Free space even if not building large package (useful when building a large number of packages)"
+        description: "Free space even if not building large package"
         type: boolean
         default: false
 
-permissions: {} # none
+permissions: {}
 
 concurrency:
   group: ${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || github.run_id }}
@@ -43,11 +34,9 @@ jobs:
       tag: ${{ steps.tag.outputs.tag }}
       timestamp: ${{ steps.tag.outputs.timestamp }}
     steps:
-    - name: Checkout (shallow)
-      uses: actions/checkout@v6
+    - uses: actions/checkout@v6
       with:
         fetch-depth: 1
-
     - name: Compute release tag
       id: tag
       run: |
@@ -55,21 +44,17 @@ jobs:
         echo "tag=${TAG}"       >> "$GITHUB_OUTPUT"
         echo "timestamp=${TAG}" >> "$GITHUB_OUTPUT"
         echo ">>> release tag: ${TAG}"
-
     - name: Create release
       run: |
         set -euo pipefail
         TAG="${{ steps.tag.outputs.tag }}"
-        echo ">>> creating release '$TAG'"
         gh release create "$TAG" \
           --title "Build $TAG" \
           --notes "Automated package build.
 
         - **Created:** $TAG UTC
         - **Commit:** \`${{ github.sha }}\`
-        - **Branch:** \`${{ github.ref_name }}\`
-        - **Run:** ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-        - **Architectures:** aarch64" \
+        - **Run:** ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
           --target "${{ github.sha }}" \
           || { echo "::error::Failed to create release '$TAG'"; exit 1; }
 
@@ -86,6 +71,59 @@ jobs:
       uses: actions/checkout@v6
       with:
         fetch-depth: 1000
+
+    # ==================================================================
+    # PATCH properties.sh ON THE HOST, before docker ever runs.
+    # The workspace is bind-mounted into the container, so the patched
+    # file is what build-package.sh sees. This is the essential fix:
+    # make TERMUX_REPO_APP__PACKAGE_NAME match TERMUX_APP__PACKAGE_NAME.
+    # ==================================================================
+    - name: Patch properties.sh
+      run: |
+        set -euo pipefail
+        PROPS="scripts/properties.sh"
+        if [ ! -f "$PROPS" ]; then
+          echo "::error::scripts/properties.sh not found at $PROPS"
+          exit 1
+        fi
+
+        echo ">>> Current TERMUX_REPO_* values:"
+        grep -nE '^TERMUX_REPO_APP__|^TERMUX_REPO__' "$PROPS" || true
+        echo ">>> Current TERMUX_APP__PACKAGE_NAME:"
+        grep -nE '^TERMUX_APP__PACKAGE_NAME=' "$PROPS" || true
+
+        APP_PKG=$(grep -E '^TERMUX_APP__PACKAGE_NAME=' "$PROPS" | head -1 | cut -d'"' -f2)
+        if [ -z "$APP_PKG" ]; then
+          echo "::error::Could not extract TERMUX_APP__PACKAGE_NAME from properties.sh"
+          exit 1
+        fi
+        echo ">>> Detected app package name: $APP_PKG"
+
+        DATA_DIR="/data/data/${APP_PKG}"
+        ROOTFS="${DATA_DIR}/files"
+        PREFIX="${ROOTFS}/usr"
+
+        sed -i \
+          -e "s|^TERMUX_REPO_APP__PACKAGE_NAME=.*|TERMUX_REPO_APP__PACKAGE_NAME=\"${APP_PKG}\"|" \
+          -e "s|^TERMUX_REPO_APP__DATA_DIR=.*|TERMUX_REPO_APP__DATA_DIR=\"${DATA_DIR}\"|" \
+          -e "s|^TERMUX_REPO__CORE_DIR=.*|TERMUX_REPO__CORE_DIR=\"${DATA_DIR}/termux/core\"|" \
+          -e "s|^TERMUX_REPO__APPS_DIR=.*|TERMUX_REPO__APPS_DIR=\"${DATA_DIR}/termux/app\"|" \
+          -e "s|^TERMUX_REPO__ROOTFS=.*|TERMUX_REPO__ROOTFS=\"${ROOTFS}\"|" \
+          -e "s|^TERMUX_REPO__HOME=.*|TERMUX_REPO__HOME=\"${ROOTFS}/home\"|" \
+          -e "s|^TERMUX_REPO__PREFIX=.*|TERMUX_REPO__PREFIX=\"${PREFIX}\"|" \
+          "$PROPS"
+
+        echo ""
+        echo ">>> Patched TERMUX_REPO_* values:"
+        grep -nE '^TERMUX_REPO_APP__|^TERMUX_REPO__' "$PROPS" || true
+
+        # Verify
+        NEW_NAME=$(grep -E '^TERMUX_REPO_APP__PACKAGE_NAME=' "$PROPS" | cut -d'"' -f2)
+        if [ "$NEW_NAME" != "$APP_PKG" ]; then
+          echo "::error::patch failed — TERMUX_REPO_APP__PACKAGE_NAME is still '$NEW_NAME', expected '$APP_PKG'"
+          exit 1
+        fi
+        echo ">>> properties.sh patch OK"
 
     - name: Gather build summary
       id: build-info
@@ -244,12 +282,6 @@ jobs:
         priority: 100
         device_name: /dev/zram0
 
-    - name: Build docker image
-      if: ${{ steps.build-info.outputs.needs-docker-build == 'true' }}
-      run: |
-        docker build -t ghcr.io/termux/package-builder:latest scripts/
-        docker buildx prune -af
-
     - name: Load Docker image
       if: ${{ steps.build-info.outputs.free-space == 'true' && steps.build-info.outputs.skip-building != 'true' }}
       run: ./scripts/run-docker.sh true
@@ -272,8 +304,6 @@ jobs:
           --repo "${{ github.repository }}" \
           || echo "::warning::No .deb assets found in that release."
         echo ">>> Downloaded $(find debs-deps -name '*.deb' | wc -l) .deb files."
-        echo ">>> Sample filenames:"
-        find debs-deps -name '*.deb' -printf '    %f\n' | sort | head -10
 
     - name: Build packages
       if: ${{ steps.build-info.outputs.skip-building != 'true' }}
@@ -294,22 +324,17 @@ jobs:
         set -e
 
         PREFIX=/data/data/app.xodos2/files/usr
-
         mkdir -p "$PREFIX/var/lib/dpkg/info"
 
         DEBS_DIR=""
         for candidate in \
-          "$PWD/debs-deps" \
-          ./debs-deps \
+          "$PWD/debs-deps" ./debs-deps \
           /home/builder/termux-packages/debs-deps \
           /root/termux-packages/debs-deps \
-          /tmp/debs-deps \
-          /workspace/debs-deps \
-          /github/workspace/debs-deps \
-        ; do
+          /tmp/debs-deps /workspace/debs-deps /github/workspace/debs-deps
+        do
           if [ -d "$candidate" ] && ls "$candidate"/*.deb >/dev/null 2>&1; then
-            DEBS_DIR="$candidate"
-            break
+            DEBS_DIR="$candidate"; break
           fi
         done
 
@@ -320,63 +345,33 @@ jobs:
           exit 1
         fi
         echo ">>> Found debs-deps at: $DEBS_DIR"
-        echo ">>> DEBS_DIR filenames (sample):"
+        echo ">>> Sample filenames:"
         find "$DEBS_DIR" -name '*.deb' -printf '    %f\n' | sort | head -15
         echo ""
 
-        # ==================================================================
-        # STEP 1 — fix properties.sh so the -i/-I flag is not ignored.
-        # build-package.sh refuses to use the repo download path if
-        # TERMUX_REPO_APP__PACKAGE_NAME != TERMUX_APP__PACKAGE_NAME.
-        # We edit the file inside the container; the change is ephemeral
-        # (reverted on next fresh container).
-        # ==================================================================
+        # --------------------------------------------------------------
+        # Confirm the workspace properties.sh (patched on host) is the
+        # one that build-package.sh will source.
+        # --------------------------------------------------------------
         PROPS="/home/builder/termux-packages/scripts/properties.sh"
         if [ -f "$PROPS" ]; then
-          echo ">>> Patching properties.sh — matching TERMUX_REPO_* to app.xodos2"
-          sed -i 's|^TERMUX_REPO_APP__PACKAGE_NAME=.*|TERMUX_REPO_APP__PACKAGE_NAME="app.xodos2"|'           "$PROPS" || true
-          sed -i 's|^TERMUX_REPO_APP__DATA_DIR=.*|TERMUX_REPO_APP__DATA_DIR="/data/data/app.xodos2"|'       "$PROPS" || true
-          sed -i 's|^TERMUX_REPO__CORE_DIR=.*|TERMUX_REPO__CORE_DIR="/data/data/app.xodos2/termux/core"|'  "$PROPS" || true
-          sed -i 's|^TERMUX_REPO__APPS_DIR=.*|TERMUX_REPO__APPS_DIR="/data/data/app.xodos2/termux/app"|'   "$PROPS" || true
-          sed -i 's|^TERMUX_REPO__ROOTFS=.*|TERMUX_REPO__ROOTFS="/data/data/app.xodos2/files"|'            "$PROPS" || true
-          sed -i 's|^TERMUX_REPO__HOME=.*|TERMUX_REPO__HOME="/data/data/app.xodos2/files/home"|'           "$PROPS" || true
-          sed -i 's|^TERMUX_REPO__PREFIX=.*|TERMUX_REPO__PREFIX="/data/data/app.xodos2/files/usr"|'        "$PROPS" || true
-          echo ">>> New values:"
-          grep -E '^TERMUX_REPO' "$PROPS" || true
+          echo ">>> Confirm properties.sh inside container:"
+          grep -nE '^TERMUX_REPO_APP__PACKAGE_NAME=|^TERMUX_APP__PACKAGE_NAME=' "$PROPS" || true
         fi
-
-        # ==================================================================
-        # STEP 2 — tell build-package.sh to reuse our local .debs instead
-        # of trying to fetch them from a remote repo.
-        # The reuse path is inside termux_download_deb_pac.
-        # ==================================================================
-        export TERMUX_PKGS__BUILD__REUSE_BUILT_PACKAGES=true
-        export TERMUX_OUTPUT_DIR="$DEBS_DIR"
-        echo ">>> TERMUX_PKGS__BUILD__REUSE_BUILT_PACKAGES=$TERMUX_PKGS__BUILD__REUSE_BUILT_PACKAGES"
-        echo ">>> TERMUX_OUTPUT_DIR=$TERMUX_OUTPUT_DIR"
-
-        # ==================================================================
-        # STEP 3 — also install the .debs via dpkg so any internal
-        # dpkg-query calls from build-package.sh return "installed".
-        # ==================================================================
-        export DPKG_ADMINDIR="$PREFIX/var/lib/dpkg"
-
         echo ""
-        echo ">>> Installing via dpkg -i (belt-and-braces, in case reuse path skips)"
+
+        export DPKG_ADMINDIR="$PREFIX/var/lib/dpkg"
+        echo ">>> DPKG_ADMINDIR=$DPKG_ADMINDIR"
+
+        echo ">>> Installing .debs via dpkg"
         dpkg --instdir=/ --force-all -i "$DEBS_DIR"/*.deb \
           || echo ">>> dpkg -i returned non-zero (continuing)"
-
         dpkg --instdir=/ --force-all --configure -a \
           || echo ">>> dpkg --configure -a returned non-zero (continuing)"
 
         echo ""
-        echo ">>> Sanity — status counts:"
-        echo "  total:                $(grep -c '^Package:' "$PREFIX/var/lib/dpkg/status" || echo 0)"
-        echo "  install ok installed: $(grep -c '^Status: install ok installed' "$PREFIX/var/lib/dpkg/status" || echo 0)"
-
-        echo ""
-        echo ">>> Sanity — dpkg-query (with DPKG_ADMINDIR):"
-        for c in libexpat openssl ncurses readline libandroid-support xorgproto xorg-util-macros zlib; do
+        echo ">>> dpkg-query sample:"
+        for c in libexpat openssl ncurses readline libandroid-support zlib; do
           st=$(dpkg-query -W --showformat='${Status}' "$c" 2>/dev/null || true)
           printf '  %-25s -> %s\n' "$c" "${st:-NOT FOUND}"
         done
@@ -385,7 +380,9 @@ jobs:
         echo ">>> Building: __PKGS_PLACEHOLDER__"
         echo ""
 
-        ./build-package.sh -C -a aarch64 __PKGS_PLACEHOLDER__
+        # -I tells build-package.sh: use the repo when a dep is missing.
+        # With matching names in properties.sh, this flag is honoured.
+        ./build-package.sh -I -C -a aarch64 __PKGS_PLACEHOLDER__
         INNER_EOF
 
           sed -i "s|__PKGS_PLACEHOLDER__|${PKGS_STR}|g" /tmp/inner-build.sh
@@ -403,26 +400,22 @@ jobs:
       if: always()
       run: |
         test -d termux-packages/output && mv termux-packages/output/* ./output/
-
         for repo in $(jq --raw-output 'del(.pkg_format) | .[].name' repo.json); do
           test -f ./built_${repo}_packages.txt && mv ./built_${repo}_packages.txt ./debs/
           test -f ./built_${repo}_subpackages.txt && cat ./built_${repo}_subpackages.txt >> ./debs/built_${repo}_packages.txt && rm ./built_${repo}_subpackages.txt
           test -f ./deleted_${repo}_packages.txt && mv ./deleted_${repo}_packages.txt ./debs/
-
           if [ -f "./debs/built_${repo}_packages.txt" ] && [ -d "output" ]; then
             while read -r pkg; do
               find output \( -name "$pkg_*.deb" -o -name "$pkg-static_*.deb" \) -type f -print0 | xargs -0r mv -t debs/
             done < <(cat "./debs/built_${repo}_packages.txt")
           fi
         done
-
         echo ">>> debs/ contains: $(find debs -type f -name '*.deb' | wc -l) .deb files"
         tar cf artifacts/debs-${{ matrix.target_arch }}-${{ github.sha }}.tar debs
 
     - name: Checksums for built *.deb files
       if: always()
-      run: |
-        find debs -type f -name "*.deb" -exec sha256sum "{}" \; | sort -k2 | tee checksum-${{ matrix.target_arch }}-${{ github.sha }}.txt
+      run: find debs -type f -name "*.deb" -exec sha256sum "{}" \; | sort -k2 | tee checksum-${{ matrix.target_arch }}-${{ github.sha }}.txt
 
     - name: Store checksums for built *.deb files
       if: always()
@@ -443,8 +436,7 @@ jobs:
       run: sudo dmesg | grep apparmor
 
   test-buildorder-random:
-    permissions:
-      contents: read
+    permissions: { contents: read }
     runs-on: ubuntu-slim
     steps:
     - uses: actions/checkout@v6
@@ -459,8 +451,7 @@ jobs:
       env: { TERMUX_ARCH: x86_64 }
 
   upload-test:
-    permissions:
-      contents: read
+    permissions: { contents: read }
     if: github.repository == 'termux/termux-packages' && github.ref != 'refs/heads/master'
     needs: build
     runs-on: ubuntu-slim
@@ -476,15 +467,13 @@ jobs:
             exit 0
           fi
         fi
-        for archive in debs-*/debs-{aarch64,arm,i686,x86_64}-${{ github.sha }}.tar; do
-          tar xf "$archive"
-        done
+        for archive in debs-*/debs-{aarch64,arm,i686,x86_64}-${{ github.sha }}.tar; do tar xf "$archive"; done
         error=0
         for repo in $(jq --raw-output 'del(.pkg_format) | keys | .[]' repo.json); do
           name=$(jq --raw-output '.["'${repo}'"].name' repo.json)
+          url=$(jq --raw-output '.["'${repo}'"].url' repo.json)
           distribution=$(jq --raw-output '.["'${repo}'"].distribution' repo.json)
           component=$(jq --raw-output '.["'${repo}'"].component' repo.json)
-          url=$(jq --raw-output '.["'${repo}'"].url' repo.json)
           [ ! -f debs/built_${name}_packages.txt ] && continue
           [ -z "$(cat debs/built_${name}_packages.txt)" ] && continue
           for arch in aarch64 arm i686 x86_64; do
@@ -495,21 +484,14 @@ jobs:
               7z x "Packages-${repo}-${arch}.bz2" > /dev/null
             fi
             result=$(find debs -maxdepth 1 -type f | cut -d"/" -f2 | xargs -P$(nproc) -i{} grep "^Filename:.*/{}$" -nH "Packages-${repo}-${arch}" || true)
-            if [ -n "$result" ]; then
-              echo "$result" | grep -E "${arch}|all" || true
-              error=1
-            fi
+            [ -n "$result" ] && { echo "$result" | grep -E "${arch}|all" || true; error=1; }
           done
         done
-        if [ "$error" != 0 ]; then
-          echo "[!] Found local files same name with server files!"
-          exit 1
-        fi
+        [ "$error" != 0 ] && { echo "[!] Found local files same name with server files!"; exit 1; }
 
   upload:
     concurrency: ${{ github.workflow }}
-    permissions:
-      contents: read
+    permissions: { contents: read }
     if: github.repository == 'termux/termux-packages' && github.ref == 'refs/heads/master'
     needs: build
     runs-on: ubuntu-slim
@@ -525,9 +507,7 @@ jobs:
         GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
       run: |
         source scripts/aptly_api.sh
-        for archive in debs-*/debs-{aarch64,arm,i686,x86_64}-${{ github.sha }}.tar; do
-          tar xf "$archive"
-        done
+        for archive in debs-*/debs-{aarch64,arm,i686,x86_64}-${{ github.sha }}.tar; do tar xf "$archive"; done
         for repo in $(jq --raw-output 'del(.pkg_format) | keys | .[]' repo.json); do
           export REPOSITORY_NAME=$(jq --raw-output '.["'$repo'"].name' repo.json)
           export REPOSITORY_DISTRIBUTION=$(jq --raw-output '.["'$repo'"].distribution' repo.json)
@@ -548,8 +528,7 @@ jobs:
         done
 
   release:
-    permissions:
-      contents: write
+    permissions: { contents: write }
     needs: [build, prepare-release]
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-24.04
@@ -558,10 +537,8 @@ jobs:
     steps:
     - uses: actions/checkout@v6
       with: { fetch-depth: 1 }
-
     - uses: actions/download-artifact@v7
       with: { path: ./all-artifacts }
-
     - name: Extract .deb files from tarballs
       run: |
         set -euo pipefail
@@ -589,8 +566,7 @@ jobs:
         i=0; failed=0
         for f in "${FILES[@]}"; do
           i=$((i + 1))
-          name="$(basename "$f")"
-          printf '[%d/%d] %s ... ' "$i" "$total" "$name"
+          printf '[%d/%d] %s ... ' "$i" "$total" "$(basename "$f")"
           ok=0
           for attempt in 1 2 3 4 5; do
             if gh release upload "$TAG" "$f" --clobber 2>/tmp/gh_err.log; then ok=1; break; fi
@@ -600,7 +576,7 @@ jobs:
               backoff=$((attempt * 3)); echo; echo "  ↳ retry in ${backoff}s"; cat /tmp/gh_err.log || true; sleep "$backoff"
             fi
           done
-          if [ "$ok" -eq 1 ]; then echo ok; else echo "FAILED: $name"; failed=$((failed + 1)); fi
+          if [ "$ok" -eq 1 ]; then echo ok; else echo "FAILED: $(basename "$f")"; failed=$((failed + 1)); fi
           sleep 1
         done
         [ "$failed" -gt 0 ] && { echo "::error::${failed}/${total} failed"; exit 1; }
@@ -608,7 +584,6 @@ jobs:
 
     - name: Verify release assets
       run: |
-        set -euo pipefail
         TAG="${{ needs.prepare-release.outputs.tag }}"
         count=$(gh release view "$TAG" --json assets --jq '.assets | length')
         echo ">>> release ${TAG} has ${count} assets"
