@@ -348,6 +348,28 @@ jobs:
       run: |
         ./scripts/free-space.sh
 
+    # ------------------------------------------------------------------
+    # Download the pre-built .deb files from the known-good release
+    # ------------------------------------------------------------------
+    - name: Download pre-built dependencies
+      if: ${{ steps.build-info.outputs.skip-building != 'true' }}
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        set -euo pipefail
+        mkdir -p debs-deps
+        echo ">>> Downloading pre-built .deb files from release 2026.10.03-230607"
+        gh release download 2026.10.03-230607 \
+          -p "*.deb" \
+          -D debs-deps \
+          --repo "${{ github.repository }}" \
+          || echo "::warning::No .deb assets found in that release."
+        echo ">>> Downloaded $(find debs-deps -name '*.deb' | wc -l) .deb files."
+
+    # ------------------------------------------------------------------
+    # Extract every .deb into the Termux prefix, then build the target
+    # package WITHOUT -I. Deps are found by path, not by dpkg.
+    # ------------------------------------------------------------------
     - name: Build packages
       if: ${{ steps.build-info.outputs.skip-building != 'true' }}
       run: |
@@ -362,7 +384,43 @@ jobs:
         echo "packages: ${packages[*]}"
 
         if [[ "${#packages[@]}" -gt 0 ]]; then
-          ./scripts/run-docker.sh -d ./build-package.sh -I -C -a "${{ matrix.target_arch }}" "${packages[@]}" || \
+          cat > ./inner-build.sh <<INNER_EOF
+set -e
+
+# Match the prefix defined in scripts/properties.sh
+PREFIX=/data/data/app.xodos2/files/usr
+
+# Create the prefix if the image doesn't already have it (stock image
+# uses com.termux path, so this custom path needs to be made).
+if [ ! -d "\$PREFIX" ]; then
+  if ! mkdir -p "\$PREFIX" 2>/dev/null; then
+    echo ">>> Creating prefix with sudo..."
+    sudo mkdir -p "\$PREFIX"
+    sudo chown -R "\$(id -u):\$(id -g)" "\$PREFIX"
+  fi
+fi
+
+echo ">>> Extracting pre-built dependencies into \$PREFIX"
+count=0
+shopt -s nullglob
+for deb in /root/termux-packages/debs-deps/*.deb; do
+  echo "    \$(basename "\$deb")"
+  dpkg-deb -x "\$deb" "\$PREFIX"
+  count=\$((count + 1))
+done
+echo ">>> Extracted \$count .deb files."
+
+echo ""
+echo ">>> Building requested packages (no -I):"
+echo "    ${packages[*]}"
+echo ""
+
+./build-package.sh -C -a aarch64 ${packages[*]}
+INNER_EOF
+
+          chmod +x ./inner-build.sh
+
+          ./scripts/run-docker.sh -d bash /root/termux-packages/inner-build.sh || \
             echo "::warning::Some packages failed to build for ${{ matrix.target_arch }} — continuing so the successful ones can still be uploaded and released"
         fi
 
