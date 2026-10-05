@@ -349,7 +349,7 @@ jobs:
         ./scripts/free-space.sh
 
     # ------------------------------------------------------------------
-    # Download the pre-built .deb files from the known-good release
+    # Download pre-built .deb files from the known-good release
     # ------------------------------------------------------------------
     - name: Download pre-built dependencies
       if: ${{ steps.build-info.outputs.skip-building != 'true' }}
@@ -367,8 +367,14 @@ jobs:
         echo ">>> Downloaded $(find debs-deps -name '*.deb' | wc -l) .deb files."
 
     # ------------------------------------------------------------------
-    # Extract every .deb into the Termux prefix, then build the target
-    # package WITHOUT -I. Deps are found by path, not by dpkg.
+    # Extract every pre-built .deb into the Termux prefix, then build
+    # only the requested package. Deps are found by path; no dpkg, no
+    # apt, no -I.
+    #
+    # NOTE: We do NOT write an external script and execute it. The
+    # workspace is mounted into the container without execute permission
+    # (noexec), so `bash /root/termux-packages/foo.sh` also fails. Instead
+    # we pass the whole script inline to `bash -c`.
     # ------------------------------------------------------------------
     - name: Build packages
       if: ${{ steps.build-info.outputs.skip-building != 'true' }}
@@ -381,30 +387,35 @@ jobs:
           fi
         done
 
-        echo "packages: ${packages[*]}"
+        PKGS_STR="${packages[*]}"
+        echo "packages: ${PKGS_STR}"
 
         if [[ "${#packages[@]}" -gt 0 ]]; then
-          {
-            echo 'set -e'
-            echo 'PREFIX=/data/data/app.xodos2/files/usr'
-            echo 'mkdir -p "$PREFIX"'
-            echo 'shopt -s nullglob'
-            echo 'count=0'
-            echo 'for deb in /root/termux-packages/debs-deps/*.deb; do'
-            echo '  echo ">>> Extracting $(basename "$deb")"'
-            echo '  dpkg-deb -x "$deb" "$PREFIX"'
-            echo '  count=$((count + 1))'
-            echo 'done'
-            echo 'echo ">>> Extracted $count .deb files"'
-            echo "./build-package.sh -C -a aarch64 ${packages[*]}"
-          } > ./inner-build.sh
+          ./scripts/run-docker.sh -d bash -c '
+            set -e
 
-          chmod +x ./inner-build.sh
-          echo ">>> inner-build.sh content:"
-          cat ./inner-build.sh
-          echo ">>> ---"
+            PREFIX=/data/data/app.xodos2/files/usr
+            mkdir -p "$PREFIX" 2>/dev/null || {
+              sudo mkdir -p "$PREFIX"
+              sudo chown -R "$(id -u):$(id -g)" "$PREFIX"
+            }
 
-          ./scripts/run-docker.sh -d bash /root/termux-packages/inner-build.sh || \
+            echo ">>> Extracting pre-built .deb files into $PREFIX"
+            shopt -s nullglob
+            count=0
+            for deb in /root/termux-packages/debs-deps/*.deb; do
+              echo "    $(basename "$deb")"
+              dpkg-deb -x "$deb" "$PREFIX"
+              count=$((count + 1))
+            done
+            echo ">>> Extracted $count .deb files"
+
+            echo ""
+            echo ">>> Building: '"${PKGS_STR}"'"
+            echo ""
+
+            ./build-package.sh -C -a aarch64 '"${PKGS_STR}"'
+          ' || \
             echo "::warning::Some packages failed to build for ${{ matrix.target_arch }} — continuing so the successful ones can still be uploaded and released"
         fi
 
@@ -616,6 +627,9 @@ jobs:
   # -------------------------------------------------------------------
   # Uploads artifacts into the release created by 'prepare-release'.
   # Runs after the build finishes.
+  #
+  # NOTE: checkout is FIRST so `gh` finds a .git directory when it runs
+  # `gh release edit`.
   # -------------------------------------------------------------------
   release:
     permissions:
@@ -626,6 +640,11 @@ jobs:
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
+    - name: Clone repository
+      uses: actions/checkout@v6
+      with:
+        fetch-depth: 1
+
     - name: Update release notes (title + body with latest run info)
       run: |
         set -euo pipefail
@@ -640,11 +659,6 @@ jobs:
         - **Run:** ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         - **Architectures:** aarch64
         - **Packages:** \`.deb\` files. This release is updated in-place on each successful build."
-
-    - name: Clone repository
-      uses: actions/checkout@v6
-      with:
-        fetch-depth: 1
 
     - name: Download all artifacts
       uses: actions/download-artifact@v7
