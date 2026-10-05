@@ -272,6 +272,8 @@ jobs:
           --repo "${{ github.repository }}" \
           || echo "::warning::No .deb assets found in that release."
         echo ">>> Downloaded $(find debs-deps -name '*.deb' | wc -l) .deb files."
+        echo ">>> Sample filenames:"
+        find debs-deps -name '*.deb' -printf '    %f\n' | sort | head -10
 
     - name: Build packages
       if: ${{ steps.build-info.outputs.skip-building != 'true' }}
@@ -317,76 +319,72 @@ jobs:
           find / -maxdepth 6 -type d -name debs-deps 2>/dev/null || true
           exit 1
         fi
-
         echo ">>> Found debs-deps at: $DEBS_DIR"
+        echo ">>> DEBS_DIR filenames (sample):"
+        find "$DEBS_DIR" -name '*.deb' -printf '    %f\n' | sort | head -15
         echo ""
 
-        # ------------------------------------------------------------------
-        # Tell every dpkg / dpkg-query invocation — including the ones
-        # build-package.sh makes internally to decide whether a dep is
-        # already installed — to use our prefix's database.
-        #
-        # Without this, build-package.sh's internal `dpkg-query` reads
-        # /var/lib/dpkg (Ubuntu's host database), sees nothing, and
-        # rebuilds every dep from source.
-        # ------------------------------------------------------------------
-        export DPKG_ADMINDIR="$PREFIX/var/lib/dpkg"
-        echo ">>> DPKG_ADMINDIR=$DPKG_ADMINDIR"
+        # ==================================================================
+        # STEP 1 — fix properties.sh so the -i/-I flag is not ignored.
+        # build-package.sh refuses to use the repo download path if
+        # TERMUX_REPO_APP__PACKAGE_NAME != TERMUX_APP__PACKAGE_NAME.
+        # We edit the file inside the container; the change is ephemeral
+        # (reverted on next fresh container).
+        # ==================================================================
+        PROPS="/home/builder/termux-packages/scripts/properties.sh"
+        if [ -f "$PROPS" ]; then
+          echo ">>> Patching properties.sh — matching TERMUX_REPO_* to app.xodos2"
+          sed -i 's|^TERMUX_REPO_APP__PACKAGE_NAME=.*|TERMUX_REPO_APP__PACKAGE_NAME="app.xodos2"|'           "$PROPS" || true
+          sed -i 's|^TERMUX_REPO_APP__DATA_DIR=.*|TERMUX_REPO_APP__DATA_DIR="/data/data/app.xodos2"|'       "$PROPS" || true
+          sed -i 's|^TERMUX_REPO__CORE_DIR=.*|TERMUX_REPO__CORE_DIR="/data/data/app.xodos2/termux/core"|'  "$PROPS" || true
+          sed -i 's|^TERMUX_REPO__APPS_DIR=.*|TERMUX_REPO__APPS_DIR="/data/data/app.xodos2/termux/app"|'   "$PROPS" || true
+          sed -i 's|^TERMUX_REPO__ROOTFS=.*|TERMUX_REPO__ROOTFS="/data/data/app.xodos2/files"|'            "$PROPS" || true
+          sed -i 's|^TERMUX_REPO__HOME=.*|TERMUX_REPO__HOME="/data/data/app.xodos2/files/home"|'           "$PROPS" || true
+          sed -i 's|^TERMUX_REPO__PREFIX=.*|TERMUX_REPO__PREFIX="/data/data/app.xodos2/files/usr"|'        "$PROPS" || true
+          echo ">>> New values:"
+          grep -E '^TERMUX_REPO' "$PROPS" || true
+        fi
 
-        echo ">>> Installing via dpkg -i"
-        dpkg \
-          --instdir=/ \
-          --force-all \
-          -i "$DEBS_DIR"/*.deb \
+        # ==================================================================
+        # STEP 2 — tell build-package.sh to reuse our local .debs instead
+        # of trying to fetch them from a remote repo.
+        # The reuse path is inside termux_download_deb_pac.
+        # ==================================================================
+        export TERMUX_PKGS__BUILD__REUSE_BUILT_PACKAGES=true
+        export TERMUX_OUTPUT_DIR="$DEBS_DIR"
+        echo ">>> TERMUX_PKGS__BUILD__REUSE_BUILT_PACKAGES=$TERMUX_PKGS__BUILD__REUSE_BUILT_PACKAGES"
+        echo ">>> TERMUX_OUTPUT_DIR=$TERMUX_OUTPUT_DIR"
+
+        # ==================================================================
+        # STEP 3 — also install the .debs via dpkg so any internal
+        # dpkg-query calls from build-package.sh return "installed".
+        # ==================================================================
+        export DPKG_ADMINDIR="$PREFIX/var/lib/dpkg"
+
+        echo ""
+        echo ">>> Installing via dpkg -i (belt-and-braces, in case reuse path skips)"
+        dpkg --instdir=/ --force-all -i "$DEBS_DIR"/*.deb \
           || echo ">>> dpkg -i returned non-zero (continuing)"
 
-        echo ""
-        echo ">>> Pass 2: dpkg --configure -a"
-        dpkg \
-          --instdir=/ \
-          --force-all \
-          --configure -a \
+        dpkg --instdir=/ --force-all --configure -a \
           || echo ">>> dpkg --configure -a returned non-zero (continuing)"
 
         echo ""
         echo ">>> Sanity — status counts:"
-        if [ -f "$PREFIX/var/lib/dpkg/status" ]; then
-          echo "  total:                $(grep -c '^Package:' "$PREFIX/var/lib/dpkg/status" || echo 0)"
-          echo "  install ok installed: $(grep -c '^Status: install ok installed' "$PREFIX/var/lib/dpkg/status" || echo 0)"
-          echo "  install ok unpacked:  $(grep -c '^Status: install ok unpacked' "$PREFIX/var/lib/dpkg/status" || echo 0)"
-        else
-          echo "  status file MISSING"
-        fi
+        echo "  total:                $(grep -c '^Package:' "$PREFIX/var/lib/dpkg/status" || echo 0)"
+        echo "  install ok installed: $(grep -c '^Status: install ok installed' "$PREFIX/var/lib/dpkg/status" || echo 0)"
 
         echo ""
-        echo ">>> Sanity — dpkg-query results (this is what build-package.sh will see):"
-        for c in ncurses readline libexpat openssl openssl-tool xorgproto xorg-util-macros libandroid-support libandroid-wordexp libbz2 libiconv libc++ zlib; do
+        echo ">>> Sanity — dpkg-query (with DPKG_ADMINDIR):"
+        for c in libexpat openssl ncurses readline libandroid-support xorgproto xorg-util-macros zlib; do
           st=$(dpkg-query -W --showformat='${Status}' "$c" 2>/dev/null || true)
           printf '  %-25s -> %s\n' "$c" "${st:-NOT FOUND}"
-        done
-
-        echo ""
-        echo ">>> Sanity — .list files:"
-        for c in ncurses readline libexpat openssl openssl-tool xorgproto xorg-util-macros libandroid-support libandroid-wordexp libbz2 libiconv libc++ zlib; do
-          if [ -f "$PREFIX/var/lib/dpkg/info/${c}.list" ]; then
-            echo "  ${c}.list OK ($(wc -l < "$PREFIX/var/lib/dpkg/info/${c}.list") entries)"
-          else
-            echo "  ${c}.list MISSING"
-          fi
-        done
-
-        echo ""
-        echo ">>> Binaries on disk:"
-        for b in bash bzip2 openssl sh; do
-          [ -x "$PREFIX/bin/$b" ] && echo "  $PREFIX/bin/$b OK" || echo "  $PREFIX/bin/$b MISSING"
         done
 
         echo ""
         echo ">>> Building: __PKGS_PLACEHOLDER__"
         echo ""
 
-        # DPKG_ADMINDIR is exported, so all internal dpkg-query calls
-        # from build-package.sh will see our database.
         ./build-package.sh -C -a aarch64 __PKGS_PLACEHOLDER__
         INNER_EOF
 
