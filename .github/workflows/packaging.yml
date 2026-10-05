@@ -367,14 +367,14 @@ jobs:
         echo ">>> Downloaded $(find debs-deps -name '*.deb' | wc -l) .deb files."
 
     # ------------------------------------------------------------------
-    # Extract every pre-built .deb into the Termux prefix, then build
-    # only the requested package. Deps are found by path; no dpkg, no
-    # apt, no -I.
+    # Extract every pre-built .deb into the Termux prefix, register it
+    # in dpkg's status and info files, then build only the requested
+    # package.
     #
-    # NOTE: We do NOT write an external script and execute it. The
-    # workspace is mounted into the container without execute permission
-    # (noexec), so `bash /root/termux-packages/foo.sh` also fails. Instead
-    # we pass the whole script inline to `bash -c`.
+    # The registration step is what makes build-package.sh SKIP the
+    # dependency. Extracting alone is not enough - build-package.sh
+    # checks for $PREFIX/var/lib/dpkg/info/<pkg>.list, not the file
+    # system.
     # ------------------------------------------------------------------
     - name: Build packages
       if: ${{ steps.build-info.outputs.skip-building != 'true' }}
@@ -399,16 +399,70 @@ jobs:
               sudo mkdir -p "$PREFIX"
               sudo chown -R "$(id -u):$(id -g)" "$PREFIX"
             }
+            mkdir -p "$PREFIX/var/lib/dpkg/info"
+            : > "$PREFIX/var/lib/dpkg/status"
 
-            echo ">>> Extracting pre-built .deb files into $PREFIX"
-            shopt -s nullglob
-            count=0
-            for deb in /root/termux-packages/debs-deps/*.deb; do
-              echo "    $(basename "$deb")"
-              dpkg-deb -x "$deb" "$PREFIX"
-              count=$((count + 1))
+            # Locate debs-deps wherever the repo got mounted.
+            DEBS_DIR=""
+            for candidate in \
+              "$PWD/debs-deps" \
+              ./debs-deps \
+              /home/builder/termux-packages/debs-deps \
+              /root/termux-packages/debs-deps \
+              /tmp/debs-deps \
+              /workspace/debs-deps \
+              /github/workspace/debs-deps \
+            ; do
+              if [ -d "$candidate" ] && ls "$candidate"/*.deb >/dev/null 2>&1; then
+                DEBS_DIR="$candidate"
+                break
+              fi
             done
-            echo ">>> Extracted $count .deb files"
+
+            if [ -z "$DEBS_DIR" ]; then
+              echo ">>> WARNING: debs-deps not found."
+              echo ">>> CWD is: $(pwd)"
+              echo ">>> Contents of CWD:"
+              ls -la | head -40
+              echo ">>> Searching filesystem for debs-deps..."
+              find / -maxdepth 6 -type d -name debs-deps 2>/dev/null || true
+            else
+              echo ">>> Found debs-deps at: $DEBS_DIR"
+              shopt -s nullglob
+              count=0
+              for deb in "$DEBS_DIR"/*.deb; do
+                pkg=$(dpkg-deb -f "$deb" Package)
+                ver=$(dpkg-deb -f "$deb" Version)
+                arch=$(dpkg-deb -f "$deb" Architecture)
+
+                # 1. Extract file tree into prefix
+                dpkg-deb -x "$deb" "$PREFIX"
+
+                # 2. Build .list file so build-package.sh treats it as installed
+                dpkg-deb --fsys-tarfile "$deb" \
+                  | tar -tf - \
+                  | grep -v "/$" \
+                  | sed "s|^\./|$PREFIX/|" \
+                  > "$PREFIX/var/lib/dpkg/info/${pkg}.list"
+
+                # 3. Append dpkg status entry
+                cat >> "$PREFIX/var/lib/dpkg/status" <<EOF
+Package: $pkg
+Status: install ok installed
+Priority: optional
+Section: misc
+Installed-Size: 1
+Maintainer: builder
+Architecture: $arch
+Version: $ver
+Description: pre-built dependency
+
+EOF
+
+                count=$((count + 1))
+              done
+              echo ">>> Installed and registered $count pre-built packages"
+            fi
 
             echo ""
             echo ">>> Building: '"${PKGS_STR}"'"
