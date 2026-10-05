@@ -346,11 +346,9 @@ jobs:
 
         PREFIX=/data/data/app.xodos2/files/usr
 
-        # Make sure the prefix and dpkg admindir exist
-        sudo mkdir -p "$PREFIX/var/lib/dpkg/info"
-        sudo chown -R "$(id -u):$(id -g)" "$PREFIX"
+        # The container's 'builder' user already owns /data/data, so no sudo.
+        mkdir -p "$PREFIX/var/lib/dpkg/info"
 
-        # Locate the debs-deps directory (mount points vary)
         DEBS_DIR=""
         for candidate in \
           "$PWD/debs-deps" \
@@ -380,19 +378,15 @@ jobs:
 
           echo ""
           echo ">>> Installing via dpkg -i (admindir=$PREFIX/var/lib/dpkg, instdir=/)"
-          # -i installs each .deb, --instdir=/ extracts to absolute paths
-          # (which are already correct inside each package), --admindir puts
-          # the status / info files under the Termux prefix where
-          # build-package.sh looks for them.
-          # --force-depends so ordering doesn't matter.
-          # --force-overwrite in case the image already has some files.
-          sudo dpkg \
+          # -i with --instdir=/ extracts files to absolute paths (already
+          # correct inside each package) and puts status/info files under
+          # --admindir so build-package.sh finds them.
+          dpkg \
             --admindir="$PREFIX/var/lib/dpkg" \
             --instdir=/ \
-            --force-depends \
-            --force-overwrite \
+            --force-all \
             -i "$DEBS_DIR"/*.deb \
-            || true
+            || echo ">>> dpkg returned non-zero (some packages may have failed, continuing)"
 
           echo ""
           echo ">>> Sanity check — registered packages:"
@@ -456,6 +450,8 @@ jobs:
             done < <(cat "./debs/built_${repo}_packages.txt")
           fi
         done
+
+        echo ">>> debs/ contains: $(find debs -type f -name '*.deb' | wc -l) .deb files"
 
         tar cf artifacts/debs-${{ matrix.target_arch }}-${{ github.sha }}.tar debs
 
