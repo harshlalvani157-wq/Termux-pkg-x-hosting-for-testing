@@ -32,10 +32,6 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  # -------------------------------------------------------------------
-  # Runs FIRST, before the build even starts. Creates (or reuses) the
-  # fixed-tag release so it exists while the build is still running.
-  # -------------------------------------------------------------------
   prepare-release:
     permissions:
       contents: write
@@ -47,8 +43,6 @@ jobs:
       tag: ${{ steps.tag.outputs.tag }}
       timestamp: ${{ steps.tag.outputs.timestamp }}
     steps:
-    # gh release create needs a git repo on disk to determine the repo
-    # context, even when --target is passed. Shallow checkout is enough.
     - name: Checkout (shallow)
       uses: actions/checkout@v6
       with:
@@ -105,12 +99,6 @@ jobs:
       env:
         MANUAL_INPUT_PACKAGES: ${{ github.event.inputs.packages }}
       run: |
-        # We are intentionally not using .commits[0].id and .commits[-1].id as github seems to
-        # only send 20 commits in the payload for github action runs instead of the 2048 documented
-        # limit. Perhaps 2048 is the limit just for webhooks, where they haven't documented
-        # properly that the limit for github actions is only 20:
-        #
-        # https://docs.github.com/en/webhooks/webhook-events-and-payloads#push
         OLD_COMMIT="${{ github.event.before }}"
         HEAD_COMMIT="${{ github.event.after }}"
         if [ "${{ github.event_name }}" != "workflow_dispatch" ]; then
@@ -129,7 +117,6 @@ jobs:
             echo "Processing commit range: ${OLD_COMMIT}..${HEAD_COMMIT}"
             CHANGED_FILES=$(git diff-tree --no-commit-id --name-only -r "${OLD_COMMIT}" "${HEAD_COMMIT}")
           else
-            # Pull requests.
             echo "Processing pull request #${{ github.event.pull_request.number }}: ${BASE_COMMIT}..HEAD"
             CHANGED_FILES=$(git diff-tree --no-commit-id --name-only -r "${BASE_COMMIT}" "HEAD")
           fi
@@ -138,7 +125,6 @@ jobs:
         touch ./debs/.placeholder
 
         if [[ "${{ github.event_name }}" == "pull_request" && -n "$(git rev-list --merges "$(git fetch origin master >&2; git merge-base origin/master $HEAD_COMMIT)..$HEAD_COMMIT")" ]]; then
-          # Github does not allow multiline errors, but it will interpret the escape sequence %0A as a line break.
           echo "::error ::Merge commits are not allowed in pull requests.%0AYou should rebase your commits or squash them.%0Ahttps://docs.github.com/en/get-started/using-git/using-git-rebase-on-the-command-line"
           exit 1
         fi
@@ -146,10 +132,6 @@ jobs:
         OLD_COMMIT="$OLD_COMMIT" HEAD_COMMIT="$HEAD_COMMIT" GITHUB_TOKEN="${{ secrets.GITHUB_TOKEN }}" scripts/utils/termux_reuse_pr_build_artifacts.sh "${{ github.event_name }}" "${{ matrix.target_arch }}" || true
 
         if [ "${{ github.event_name }}" != "workflow_dispatch" ]; then
-          # GitHub sometimes add merge commits at the end
-          # To prevent user confusion, filter them with --no-merges
-          # Process tag '%ci:no-build' that may be added as line to commit message.
-          # Forces CI to cancel current build with status 'passed'
           if grep -qiP '^\s*%ci:no-build\s*$' <(git log --format="%B" -n 1 --no-merges "HEAD"); then
             tar cf artifacts/debs-${{ matrix.target_arch }}.tar debs
             echo "[!] Force exiting as tag '%ci:no-build' was applied to HEAD commit message."
@@ -158,28 +140,20 @@ jobs:
 
           for repo_path in $(jq --raw-output 'del(.pkg_format) | keys | .[]' repo.json); do
             repo=$(jq --raw-output '.["'${repo_path}'"].name' repo.json)
-            # Parse changed files and identify new packages and deleted packages.
-            # Create lists of those packages that will be passed to upload job for
-            # further processing.
             while read -r file; do
               if ! [[ $file == ${repo_path}/* ]]; then
-                # This file does not belong to a package, so ignore it
                 continue
               fi
               if [[ $file =~ ^${repo_path}/([.a-z0-9+-]*)/([.a-z0-9+-]*).subpackage.sh$ ]]; then
-                # A subpackage was modified, check if it was deleted or just updated
                 pkg=${BASH_REMATCH[1]}
                 subpkg=${BASH_REMATCH[2]}
                 if [ ! -f "${repo_path}/${pkg}/${subpkg}.subpackage.sh" ]; then
                   echo "$subpkg" >> ./deleted_${repo}_packages.txt
                 fi
               elif [[ $file =~ ^${repo_path}/([.a-z0-9+-]*)/.*$ ]]; then
-                # package, check if it was deleted or updated
                 pkg=${BASH_REMATCH[1]}
                 if [ -d "${repo_path}/${pkg}" ]; then
                   echo "$pkg" >> ./built_${repo}_packages.txt
-                  # If there are subpackages we want to create a list of those
-                  # as well
                   for file in $(find "${repo_path}/${pkg}/" -maxdepth 1 -type f -name \*.subpackage.sh | sort); do
                     echo "$(basename "${file%%.subpackage.sh}")" >> ./built_${repo}_subpackages.txt
                   done
@@ -190,10 +164,6 @@ jobs:
             done<<<${CHANGED_FILES}
           done
         else
-          # Manual dispatch: parse the space/newline-separated list.
-          # Each name may be a main package OR a subpackage. Subpackages are
-          # mapped back to their parent package. Unknown names are skipped
-          # with a warning instead of failing the whole run.
           read -a PACKAGES <<< "${MANUAL_INPUT_PACKAGES//$'\n'/ }"
           repo_paths=$(jq --raw-output 'del(.pkg_format) | keys | .[]' repo.json)
 
@@ -204,7 +174,6 @@ jobs:
             [ -z "$pkg" ] && continue
             found=false
 
-            # 1. Try as a main package directory
             for repo_path in $repo_paths; do
               repo=$(jq --raw-output '.["'${repo_path}'"].name' repo.json)
               if [ -d "${repo_path}/${pkg}" ]; then
@@ -219,8 +188,6 @@ jobs:
             done
             [ "$found" = true ] && continue
 
-            # 2. Try as a subpackage: search every repo's top-level packages
-            #    for a matching <name>.subpackage.sh
             for repo_path in $repo_paths; do
               repo=$(jq --raw-output '.["'${repo_path}'"].name' repo.json)
               subfile=$(find "${repo_path}" -mindepth 2 -maxdepth 2 -type f \
@@ -239,7 +206,6 @@ jobs:
             done
             [ "$found" = true ] && continue
 
-            # 3. Not found anywhere — record and continue
             missing+=("$pkg")
             echo "::warning::Package '${pkg}' not found in any repo or as a subpackage — skipping"
           done
@@ -256,7 +222,6 @@ jobs:
         fi
 
         for repo in $(jq --raw-output 'del(.pkg_format) | .[].name' repo.json); do
-          # Fix so that lists do not contain duplicates
           if [ -f ./built_${repo}_packages.txt ]; then
             sort ./built_${repo}_packages.txt | uniq > ./built_${repo}_packages.txt.tmp
             mv ./built_${repo}_packages.txt.tmp ./built_${repo}_packages.txt
@@ -301,8 +266,6 @@ jobs:
 
         needs_docker_build=false
         if [ "${{ github.event_name }}" != "workflow_dispatch" ]; then
-          # Build local Docker image if setup scripts were changed.
-          # Useful for pull requests submitting changes for both build environment and packages.
           if grep -qP '^scripts/(Dockerfile|properties\.sh|setup-android-sdk\.sh|setup-ubuntu\.sh)$' <<< "$CHANGED_FILES"; then
             needs_docker_build=true
           fi
@@ -348,9 +311,6 @@ jobs:
       run: |
         ./scripts/free-space.sh
 
-    # ------------------------------------------------------------------
-    # Download pre-built .deb files from the known-good release
-    # ------------------------------------------------------------------
     - name: Download pre-built dependencies
       if: ${{ steps.build-info.outputs.skip-building != 'true' }}
       env:
@@ -366,16 +326,6 @@ jobs:
           || echo "::warning::No .deb assets found in that release."
         echo ">>> Downloaded $(find debs-deps -name '*.deb' | wc -l) .deb files."
 
-    # ------------------------------------------------------------------
-    # Build the container-side script on the HOST (so YAML can strip
-    # the shared indentation and place the heredoc terminator at column
-    # 0). Then base64-encode it and pipe it into bash inside the
-    # container.
-    #
-    # This avoids two problems:
-    #   - noexec mount: we never execute a file from the mounted volume
-    #   - heredoc-inside-bash-c: terminators must be at column 0
-    # ------------------------------------------------------------------
     - name: Build packages
       if: ${{ steps.build-info.outputs.skip-building != 'true' }}
       run: |
@@ -395,13 +345,12 @@ jobs:
         set -e
 
         PREFIX=/data/data/app.xodos2/files/usr
-        mkdir -p "$PREFIX" 2>/dev/null || {
-          sudo mkdir -p "$PREFIX"
-          sudo chown -R "$(id -u):$(id -g)" "$PREFIX"
-        }
-        mkdir -p "$PREFIX/var/lib/dpkg/info"
-        : > "$PREFIX/var/lib/dpkg/status"
 
+        # Make sure the prefix and dpkg admindir exist
+        sudo mkdir -p "$PREFIX/var/lib/dpkg/info"
+        sudo chown -R "$(id -u):$(id -g)" "$PREFIX"
+
+        # Locate the debs-deps directory (mount points vary)
         DEBS_DIR=""
         for candidate in \
           "$PWD/debs-deps" \
@@ -420,35 +369,56 @@ jobs:
 
         if [ -z "$DEBS_DIR" ]; then
           echo ">>> WARNING: debs-deps not found."
-          echo ">>> CWD is: $(pwd)"
-          echo ">>> Contents of CWD:"
+          echo ">>> CWD: $(pwd)"
           ls -la | head -40
-          echo ">>> Searching filesystem for debs-deps..."
           find / -maxdepth 6 -type d -name debs-deps 2>/dev/null || true
         else
           echo ">>> Found debs-deps at: $DEBS_DIR"
-          shopt -s nullglob
-          count=0
-          for deb in "$DEBS_DIR"/*.deb; do
-            pkg=$(dpkg-deb -f "$deb" Package)
-            ver=$(dpkg-deb -f "$deb" Version)
-            arch=$(dpkg-deb -f "$deb" Architecture)
+          echo ">>> Sample paths inside first .deb:"
+          first_deb=$(ls "$DEBS_DIR"/*.deb | head -1)
+          dpkg-deb -c "$first_deb" 2>/dev/null | head -8 || true
 
-            dpkg-deb -x "$deb" "$PREFIX"
+          echo ""
+          echo ">>> Installing via dpkg -i (admindir=$PREFIX/var/lib/dpkg, instdir=/)"
+          # -i installs each .deb, --instdir=/ extracts to absolute paths
+          # (which are already correct inside each package), --admindir puts
+          # the status / info files under the Termux prefix where
+          # build-package.sh looks for them.
+          # --force-depends so ordering doesn't matter.
+          # --force-overwrite in case the image already has some files.
+          sudo dpkg \
+            --admindir="$PREFIX/var/lib/dpkg" \
+            --instdir=/ \
+            --force-depends \
+            --force-overwrite \
+            -i "$DEBS_DIR"/*.deb \
+            || true
 
-            dpkg-deb --fsys-tarfile "$deb" \
-              | tar -tf - \
-              | grep -v "/$" \
-              | sed "s|^\./|$PREFIX/|" \
-              > "$PREFIX/var/lib/dpkg/info/${pkg}.list"
+          echo ""
+          echo ">>> Sanity check — registered packages:"
+          if [ -f "$PREFIX/var/lib/dpkg/status" ]; then
+            echo "  status file entries: $(grep -c '^Package:' "$PREFIX/var/lib/dpkg/status" || echo 0)"
+          else
+            echo "  status file MISSING"
+          fi
 
-            printf 'Package: %s\nStatus: install ok installed\nPriority: optional\nSection: misc\nInstalled-Size: 1\nMaintainer: builder\nArchitecture: %s\nVersion: %s\nDescription: pre-built dependency\n\n' \
-              "$pkg" "$arch" "$ver" \
-              >> "$PREFIX/var/lib/dpkg/status"
-
-            count=$((count + 1))
+          for c in libandroid-wordexp libbz2 libiconv libc++; do
+            if [ -f "$PREFIX/var/lib/dpkg/info/${c}.list" ]; then
+              echo "  ${c}.list OK ($(wc -l < "$PREFIX/var/lib/dpkg/info/${c}.list") entries)"
+            else
+              echo "  ${c}.list MISSING"
+            fi
           done
-          echo ">>> Installed and registered $count pre-built packages"
+
+          echo ""
+          echo ">>> Sanity check — binaries on disk:"
+          for b in bash bzip2; do
+            if [ -x "$PREFIX/bin/$b" ]; then
+              echo "  $PREFIX/bin/$b OK"
+            else
+              echo "  $PREFIX/bin/$b MISSING"
+            fi
+          done
         fi
 
         echo ""
@@ -475,25 +445,18 @@ jobs:
         test -d termux-packages/output && mv termux-packages/output/* ./output/
 
         for repo in $(jq --raw-output 'del(.pkg_format) | .[].name' repo.json); do
-          # Put package lists into directory with *.deb files so they will be transferred to
-          # upload job.
           test -f ./built_${repo}_packages.txt && mv ./built_${repo}_packages.txt ./debs/
           test -f ./built_${repo}_subpackages.txt && cat ./built_${repo}_subpackages.txt >> ./debs/built_${repo}_packages.txt \
             && rm ./built_${repo}_subpackages.txt
           test -f ./deleted_${repo}_packages.txt && mv ./deleted_${repo}_packages.txt ./debs/
 
-          # Move only debs from built_packages into debs/ folder before
-          # creating an archive.
           if [ -f "./debs/built_${repo}_packages.txt" ] && [ -d "output" ]; then
             while read -r pkg; do
-              # Match both $pkg.deb and $pkg-static.deb.
               find output \( -name "$pkg_*.deb" -o -name "$pkg-static_*.deb" \) -type f -print0 | xargs -0r mv -t debs/
             done < <(cat "./debs/built_${repo}_packages.txt")
           fi
         done
 
-        # Files containing certain symbols (e.g. ":") will cause failure in actions/upload-artifact.
-        # Archiving *.deb files in a tarball to avoid issues with uploading.
         tar cf artifacts/debs-${{ matrix.target_arch }}-${{ github.sha }}.tar debs
 
     - name: Checksums for built *.deb files
@@ -562,10 +525,6 @@ jobs:
     - name: Check packages using Packages.bz2
       run: |
         if [ "${{ github.event_name }}" != "workflow_dispatch" ]; then
-          # GitHub sometimes add merge commits at the end
-          # To prevent user confusion, filter them with --no-merges
-          # Process tag '%ci:no-build' that may be added as line to commit message.
-          # Forces CI to cancel current build with status 'passed'
           if grep -qiP '^\s*%ci:no-build\s*$' <(git log --format="%B" -n 1 --no-merges "HEAD"); then
             echo "[!] Force exiting as tag '%ci:no-build' was applied to HEAD commit message."
             exit 0
@@ -643,7 +602,6 @@ jobs:
           export REPOSITORY_NAME=$(jq --raw-output '.["'$repo'"].name' repo.json)
           export REPOSITORY_DISTRIBUTION=$(jq --raw-output '.["'$repo'"].distribution' repo.json)
 
-          # Upload file to temporary directory.
           uploaded_files=false
           shopt -s nullglob
 
@@ -652,21 +610,15 @@ jobs:
               if ! aptly_upload_file "$filename"; then
                 exit 1
               fi
-
               uploaded_files=true
             done
             shopt -u nullglob
 
-            # Publishing repository changes.
             if [ "$uploaded_files" = "true" ]; then
               if ! aptly_add_to_repo; then
                 exit 1
               fi
-
-              # Usually temporary directory is deleted automatically, but in certain cases it is left.
               aptly_delete_dir
-
-              # Final part to make changes appear in web root.
               if ! aptly_publish_repo; then
                 exit 1
               fi
@@ -674,13 +626,6 @@ jobs:
           fi
         done
 
-  # -------------------------------------------------------------------
-  # Uploads artifacts into the release created by 'prepare-release'.
-  # Runs after the build finishes.
-  #
-  # NOTE: checkout is FIRST so `gh` finds a .git directory when it runs
-  # `gh release edit`.
-  # -------------------------------------------------------------------
   release:
     permissions:
       contents: write
@@ -733,8 +678,6 @@ jobs:
           exit 1
         fi
 
-        # The tarballs contain a top-level `debs/` directory; after extraction
-        # all architectures are merged into release-debs/debs/*.deb
         count=$(find release-debs -type f -name '*.deb' | wc -l)
         echo ">>> found ${count} .deb files"
         if [ "$count" -eq 0 ]; then
@@ -750,7 +693,6 @@ jobs:
         set -euo pipefail
         TAG="${{ needs.prepare-release.outputs.tag }}"
 
-        # Collect all debs into a stable order
         mapfile -t FILES < <(find release-debs -type f -name '*.deb' | sort)
         total="${#FILES[@]}"
         echo ">>> uploading ${total} files serially into release '${TAG}'"
@@ -768,7 +710,6 @@ jobs:
               ok=1
               break
             fi
-            # Detect secondary rate limit and back off hard
             if grep -qiE 'secondary rate limit|abuse|rate limit' /tmp/gh_err.log; then
               backoff=$((attempt * 15))
               echo
@@ -790,7 +731,6 @@ jobs:
             failed=$((failed + 1))
           fi
 
-          # Small steady delay between successful uploads to stay under rate limits
           sleep 1
         done
 
