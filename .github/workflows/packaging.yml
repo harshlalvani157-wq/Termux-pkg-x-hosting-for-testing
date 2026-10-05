@@ -61,7 +61,6 @@ jobs:
       run: |
         set -euo pipefail
         TAG="${{ steps.tag.outputs.tag }}"
-
         if gh release view "$TAG" >/dev/null 2>&1; then
           echo ">>> release '$TAG' already exists — will overwrite its assets"
         else
@@ -114,10 +113,8 @@ jobs:
                 OLD_COMMIT=$(git fetch origin master >&2; git merge-base origin/master $HEAD_COMMIT)
               fi
             fi
-            echo "Processing commit range: ${OLD_COMMIT}..${HEAD_COMMIT}"
             CHANGED_FILES=$(git diff-tree --no-commit-id --name-only -r "${OLD_COMMIT}" "${HEAD_COMMIT}")
           else
-            echo "Processing pull request #${{ github.event.pull_request.number }}: ${BASE_COMMIT}..HEAD"
             CHANGED_FILES=$(git diff-tree --no-commit-id --name-only -r "${BASE_COMMIT}" "HEAD")
           fi
         fi
@@ -125,7 +122,7 @@ jobs:
         touch ./debs/.placeholder
 
         if [[ "${{ github.event_name }}" == "pull_request" && -n "$(git rev-list --merges "$(git fetch origin master >&2; git merge-base origin/master $HEAD_COMMIT)..$HEAD_COMMIT")" ]]; then
-          echo "::error ::Merge commits are not allowed in pull requests.%0AYou should rebase your commits or squash them.%0Ahttps://docs.github.com/en/get-started/using-git/using-git-rebase-on-the-command-line"
+          echo "::error ::Merge commits are not allowed in pull requests."
           exit 1
         fi
 
@@ -141,12 +138,9 @@ jobs:
           for repo_path in $(jq --raw-output 'del(.pkg_format) | keys | .[]' repo.json); do
             repo=$(jq --raw-output '.["'${repo_path}'"].name' repo.json)
             while read -r file; do
-              if ! [[ $file == ${repo_path}/* ]]; then
-                continue
-              fi
+              if ! [[ $file == ${repo_path}/* ]]; then continue; fi
               if [[ $file =~ ^${repo_path}/([.a-z0-9+-]*)/([.a-z0-9+-]*).subpackage.sh$ ]]; then
-                pkg=${BASH_REMATCH[1]}
-                subpkg=${BASH_REMATCH[2]}
+                pkg=${BASH_REMATCH[1]}; subpkg=${BASH_REMATCH[2]}
                 if [ ! -f "${repo_path}/${pkg}/${subpkg}.subpackage.sh" ]; then
                   echo "$subpkg" >> ./deleted_${repo}_packages.txt
                 fi
@@ -166,14 +160,11 @@ jobs:
         else
           read -a PACKAGES <<< "${MANUAL_INPUT_PACKAGES//$'\n'/ }"
           repo_paths=$(jq --raw-output 'del(.pkg_format) | keys | .[]' repo.json)
-
           declare -a resolved=()
           declare -a missing=()
-
           for pkg in "${PACKAGES[@]}"; do
             [ -z "$pkg" ] && continue
             found=false
-
             for repo_path in $repo_paths; do
               repo=$(jq --raw-output '.["'${repo_path}'"].name' repo.json)
               if [ -d "${repo_path}/${pkg}" ]; then
@@ -182,16 +173,13 @@ jobs:
                 for subpkg in $(find "${repo_path}/${pkg}/" -maxdepth 1 -type f -name \*.subpackage.sh | sort); do
                   echo "$(basename "${subpkg%%.subpackage.sh}")" >> ./built_${repo}_subpackages.txt
                 done
-                resolved+=("$pkg")
-                break
+                resolved+=("$pkg"); break
               fi
             done
             [ "$found" = true ] && continue
-
             for repo_path in $repo_paths; do
               repo=$(jq --raw-output '.["'${repo_path}'"].name' repo.json)
-              subfile=$(find "${repo_path}" -mindepth 2 -maxdepth 2 -type f \
-                          -name "${pkg}.subpackage.sh" -print -quit 2>/dev/null || true)
+              subfile=$(find "${repo_path}" -mindepth 2 -maxdepth 2 -type f -name "${pkg}.subpackage.sh" -print -quit 2>/dev/null || true)
               if [ -n "$subfile" ]; then
                 parent=$(basename "$(dirname "$subfile")")
                 echo ">>> '${pkg}' is a subpackage of '${parent}' — building '${parent}' instead"
@@ -200,75 +188,47 @@ jobs:
                 for s in $(find "${repo_path}/${parent}/" -maxdepth 1 -type f -name \*.subpackage.sh | sort); do
                   echo "$(basename "${s%%.subpackage.sh}")" >> ./built_${repo}_subpackages.txt
                 done
-                resolved+=("$pkg -> $parent")
-                break
+                resolved+=("$pkg -> $parent"); break
               fi
             done
             [ "$found" = true ] && continue
-
             missing+=("$pkg")
-            echo "::warning::Package '${pkg}' not found in any repo or as a subpackage — skipping"
+            echo "::warning::Package '${pkg}' not found — skipping"
           done
-
-          echo ">>> resolved ${#resolved[@]} package(s): ${resolved[*]:-<none>}"
-          if [ "${#missing[@]}" -gt 0 ]; then
-            echo ">>> skipped ${#missing[@]} unknown name(s): ${missing[*]}"
-          fi
-
-          if [ "${#resolved[@]}" -eq 0 ]; then
-            echo "::error::None of the requested packages were found. Aborting."
-            exit 1
-          fi
+          echo ">>> resolved ${#resolved[@]}: ${resolved[*]:-<none>}"
+          [ "${#missing[@]}" -gt 0 ] && echo ">>> skipped ${#missing[@]}: ${missing[*]}"
+          [ "${#resolved[@]}" -eq 0 ] && { echo "::error::None found."; exit 1; }
         fi
 
         for repo in $(jq --raw-output 'del(.pkg_format) | .[].name' repo.json); do
-          if [ -f ./built_${repo}_packages.txt ]; then
-            sort ./built_${repo}_packages.txt | uniq > ./built_${repo}_packages.txt.tmp
-            mv ./built_${repo}_packages.txt.tmp ./built_${repo}_packages.txt
-          fi
-          if [ -f ./built_${repo}_subpackages.txt ]; then
-            sort ./built_${repo}_subpackages.txt | uniq > ./built_${repo}_subpackages.txt.tmp
-            mv ./built_${repo}_subpackages.txt.tmp ./built_${repo}_subpackages.txt
-          fi
-          if [ -f ./deleted_${repo}_packages.txt ]; then
-            sort ./deleted_${repo}_packages.txt | uniq > ./deleted_${repo}_packages.txt.tmp
-            mv ./deleted_${repo}_packages.txt.tmp ./deleted_${repo}_packages.txt
-          fi
+          [ -f ./built_${repo}_packages.txt ]     && sort ./built_${repo}_packages.txt     | uniq > ./tmp && mv ./tmp ./built_${repo}_packages.txt
+          [ -f ./built_${repo}_subpackages.txt ]  && sort ./built_${repo}_subpackages.txt  | uniq > ./tmp && mv ./tmp ./built_${repo}_subpackages.txt
+          [ -f ./deleted_${repo}_packages.txt ]   && sort ./deleted_${repo}_packages.txt   | uniq > ./tmp && mv ./tmp ./deleted_${repo}_packages.txt
         done
 
         declare -a packages=()
         for repo_path in $(jq --raw-output 'del(.pkg_format) | keys | .[]' repo.json); do
           repo=$(jq --raw-output '.["'${repo_path}'"].name' repo.json)
-          if [ -f "./built_${repo}_packages.txt" ]; then
-            packages+=($(cat "./built_${repo}_packages.txt"))
-          fi
+          [ -f "./built_${repo}_packages.txt" ] && packages+=($(cat "./built_${repo}_packages.txt"))
         done
-
         echo "packages: ${packages[*]}"
 
         free_space='false'
         if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
           free_space=${{ github.event.inputs.free-space }}
         else
-          if grep -qiP '^\s*%ci:free-disk\s*$' <(git log --format="%B" -n 1 --no-merges "HEAD"); then
-            free_space=true
-          fi
+          grep -qiP '^\s*%ci:free-disk\s*$' <(git log --format="%B" -n 1 --no-merges "HEAD") && free_space=true
         fi
         if [[ "${#packages[@]}" -gt 0 ]]; then
           for pkg in "${packages[@]}"; do
-            if grep -qFx "$pkg" ./scripts/big-pkgs.list; then
-              free_space='true'
-              break
-            fi
+            grep -qFx "$pkg" ./scripts/big-pkgs.list && { free_space='true'; break; }
           done
         fi
         echo "free-space=$free_space" >> $GITHUB_OUTPUT
 
         needs_docker_build=false
         if [ "${{ github.event_name }}" != "workflow_dispatch" ]; then
-          if grep -qP '^scripts/(Dockerfile|properties\.sh|setup-android-sdk\.sh|setup-ubuntu\.sh)$' <<< "$CHANGED_FILES"; then
-            needs_docker_build=true
-          fi
+          grep -qP '^scripts/(Dockerfile|properties\.sh|setup-android-sdk\.sh|setup-ubuntu\.sh)$' <<< "$CHANGED_FILES" && needs_docker_build=true
         fi
         echo "needs-docker-build=$needs_docker_build" >> $GITHUB_OUTPUT
 
@@ -277,14 +237,9 @@ jobs:
         declare -a package_recipes=()
         for repo_path in $(jq --raw-output 'del(.pkg_format) | keys | .[]' repo.json); do
           repo=$(jq --raw-output '.["'${repo_path}'"].name' repo.json)
-          if [ -f "./built_${repo}_packages.txt" ]; then
-            package_recipes+=($(cat "./built_${repo}_packages.txt" | repo_path="${repo_path}" awk '{print ENVIRON["repo_path"]"/"$1"/build.sh"}'))
-          fi
+          [ -f "./built_${repo}_packages.txt" ] && package_recipes+=($(cat "./built_${repo}_packages.txt" | repo_path="${repo_path}" awk '{print ENVIRON["repo_path"]"/"$1"/build.sh"}'))
         done
-
-        if [[ "${#package_recipes[@]}" -gt 0 ]]; then
-          ./scripts/lint-packages.sh "${package_recipes[@]}"
-        fi
+        [[ "${#package_recipes[@]}" -gt 0 ]] && ./scripts/lint-packages.sh "${package_recipes[@]}"
 
     - name: Enable zram
       if: ${{ steps.build-info.outputs.skip-building != 'true' }}
@@ -303,13 +258,11 @@ jobs:
 
     - name: Load Docker image
       if: ${{ steps.build-info.outputs.free-space == 'true' && steps.build-info.outputs.skip-building != 'true' }}
-      run: |
-        ./scripts/run-docker.sh true
+      run: ./scripts/run-docker.sh true
 
     - name: Free additional disk space (if needed)
       if: ${{ steps.build-info.outputs.free-space == 'true' && steps.build-info.outputs.skip-building != 'true' }}
-      run: |
-        ./scripts/free-space.sh
+      run: ./scripts/free-space.sh
 
     - name: Download pre-built dependencies
       if: ${{ steps.build-info.outputs.skip-building != 'true' }}
@@ -346,9 +299,41 @@ jobs:
 
         PREFIX=/data/data/app.xodos2/files/usr
 
-        # The container's 'builder' user already owns /data/data, so no sudo.
         mkdir -p "$PREFIX/var/lib/dpkg/info"
 
+        # ------------------------------------------------------------------
+        # THE FIX
+        #
+        # build-package.sh internally calls `dpkg-query` with NO --admindir.
+        # That reads /var/lib/dpkg by default. We install into
+        # $PREFIX/var/lib/dpkg, so without this symlink every dependency
+        # looks "not installed" and gets rebuilt from source.
+        #
+        # Making /var/lib/dpkg a symlink to $PREFIX/var/lib/dpkg is what
+        # tells build-package.sh everything really is installed.
+        # ------------------------------------------------------------------
+        if [ -L /var/lib/dpkg ]; then
+          echo ">>> /var/lib/dpkg is already a symlink -> $(readlink /var/lib/dpkg)"
+        elif [ -d /var/lib/dpkg ]; then
+          echo ">>> /var/lib/dpkg exists as a real directory. Backing it up."
+          sudo mv /var/lib/dpkg /var/lib/dpkg.orig 2>/dev/null || true
+          sudo mkdir -p /var/lib
+          sudo ln -sfn "$PREFIX/var/lib/dpkg" /var/lib/dpkg
+        else
+          sudo mkdir -p /var/lib
+          sudo ln -sfn "$PREFIX/var/lib/dpkg" /var/lib/dpkg
+        fi
+
+        echo ">>> /var/lib/dpkg -> $(readlink /var/lib/dpkg 2>/dev/null || echo 'NOT A SYMLINK')"
+
+        # Pre-create the classic termux prefix so preinst shebangs like
+        #   #!/data/data/com.termux/files/usr/bin/sh
+        # resolve to *something*. The interpreter inside is empty, so any
+        # script that actually tries to run through it will still fail —
+        # but that failure is caught by dpkg and does not abort the batch.
+        mkdir -p /data/data/com.termux/files/usr/bin 2>/dev/null || true
+
+        # Locate debs-deps
         DEBS_DIR=""
         for candidate in \
           "$PWD/debs-deps" \
@@ -367,51 +352,59 @@ jobs:
 
         if [ -z "$DEBS_DIR" ]; then
           echo ">>> WARNING: debs-deps not found."
-          echo ">>> CWD: $(pwd)"
           ls -la | head -40
           find / -maxdepth 6 -type d -name debs-deps 2>/dev/null || true
         else
           echo ">>> Found debs-deps at: $DEBS_DIR"
-          echo ">>> Sample paths inside first .deb:"
-          first_deb=$(ls "$DEBS_DIR"/*.deb | head -1)
-          dpkg-deb -c "$first_deb" 2>/dev/null | head -8 || true
 
           echo ""
-          echo ">>> Installing via dpkg -i (admindir=$PREFIX/var/lib/dpkg, instdir=/)"
-          # -i with --instdir=/ extracts files to absolute paths (already
-          # correct inside each package) and puts status/info files under
-          # --admindir so build-package.sh finds them.
+          echo ">>> Pass 1: dpkg -i (unpack + configure)"
           dpkg \
             --admindir="$PREFIX/var/lib/dpkg" \
             --instdir=/ \
             --force-all \
+            --log=/tmp/dpkg-ini.log \
             -i "$DEBS_DIR"/*.deb \
-            || echo ">>> dpkg returned non-zero (some packages may have failed, continuing)"
+            || echo ">>> dpkg -i returned non-zero (continuing)"
 
           echo ""
-          echo ">>> Sanity check — registered packages:"
+          echo ">>> Pass 2: dpkg --configure -a"
+          dpkg \
+            --admindir="$PREFIX/var/lib/dpkg" \
+            --instdir=/ \
+            --force-all \
+            --log=/tmp/dpkg-config.log \
+            --configure -a \
+            || echo ">>> dpkg --configure -a returned non-zero (continuing)"
+
+          echo ""
+          echo ">>> Sanity — status counts:"
           if [ -f "$PREFIX/var/lib/dpkg/status" ]; then
-            echo "  status file entries: $(grep -c '^Package:' "$PREFIX/var/lib/dpkg/status" || echo 0)"
+            echo "  total:                $(grep -c '^Package:' "$PREFIX/var/lib/dpkg/status" || echo 0)"
+            echo "  install ok installed: $(grep -c '^Status: install ok installed' "$PREFIX/var/lib/dpkg/status" || echo 0)"
+            echo "  install ok unpacked:  $(grep -c '^Status: install ok unpacked' "$PREFIX/var/lib/dpkg/status" || echo 0)"
           else
             echo "  status file MISSING"
           fi
 
-          for c in libandroid-wordexp libbz2 libiconv libc++; do
-            if [ -f "$PREFIX/var/lib/dpkg/info/${c}.list" ]; then
-              echo "  ${c}.list OK ($(wc -l < "$PREFIX/var/lib/dpkg/info/${c}.list") entries)"
-            else
-              echo "  ${c}.list MISSING"
-            fi
+          echo ""
+          echo ">>> dpkg-query with DEFAULT admindir (what build-package.sh sees):"
+          for c in libexpat openssl openssl-tool xorgproto xorg-util-macros libandroid-support libbz2 libiconv libc++ termux-tools python; do
+            s=$(dpkg-query -W --showformat='${Status}' "$c" 2>/dev/null || true)
+            echo "  $c -> ${s:-NOT FOUND}"
           done
 
           echo ""
-          echo ">>> Sanity check — binaries on disk:"
-          for b in bash bzip2; do
-            if [ -x "$PREFIX/bin/$b" ]; then
-              echo "  $PREFIX/bin/$b OK"
-            else
-              echo "  $PREFIX/bin/$b MISSING"
-            fi
+          echo ">>> dpkg-query with PREFIX admindir (what we installed):"
+          for c in libexpat openssl openssl-tool xorgproto xorg-util-macros libandroid-support libbz2 libiconv libc++ termux-tools python; do
+            s=$(dpkg-query --admindir="$PREFIX/var/lib/dpkg" -W --showformat='${Status}' "$c" 2>/dev/null || true)
+            echo "  $c -> ${s:-NOT FOUND}"
+          done
+
+          echo ""
+          echo ">>> Binaries on disk:"
+          for b in bash bzip2 openssl; do
+            [ -x "$PREFIX/bin/$b" ] && echo "  $PREFIX/bin/$b OK" || echo "  $PREFIX/bin/$b MISSING"
           done
         fi
 
@@ -430,7 +423,7 @@ jobs:
 
           ENCODED=$(base64 -w0 /tmp/inner-build.sh)
           ./scripts/run-docker.sh -d bash -c "echo '${ENCODED}' | base64 -d | bash" || \
-            echo "::warning::Some packages failed to build for ${{ matrix.target_arch }} — continuing so the successful ones can still be uploaded and released"
+            echo "::warning::Some packages failed to build — continuing so the successful ones can still be uploaded and released"
         fi
 
     - name: Generate build artifacts
@@ -440,8 +433,7 @@ jobs:
 
         for repo in $(jq --raw-output 'del(.pkg_format) | .[].name' repo.json); do
           test -f ./built_${repo}_packages.txt && mv ./built_${repo}_packages.txt ./debs/
-          test -f ./built_${repo}_subpackages.txt && cat ./built_${repo}_subpackages.txt >> ./debs/built_${repo}_packages.txt \
-            && rm ./built_${repo}_subpackages.txt
+          test -f ./built_${repo}_subpackages.txt && cat ./built_${repo}_subpackages.txt >> ./debs/built_${repo}_packages.txt && rm ./built_${repo}_subpackages.txt
           test -f ./deleted_${repo}_packages.txt && mv ./deleted_${repo}_packages.txt ./debs/
 
           if [ -f "./debs/built_${repo}_packages.txt" ] && [ -d "output" ]; then
@@ -452,7 +444,6 @@ jobs:
         done
 
         echo ">>> debs/ contains: $(find debs -type f -name '*.deb' | wc -l) .deb files"
-
         tar cf artifacts/debs-${{ matrix.target_arch }}-${{ github.sha }}.tar debs
 
     - name: Checksums for built *.deb files
@@ -476,34 +467,23 @@ jobs:
 
     - name: AppArmor Logs
       if: always()
-      run: |
-        sudo dmesg | grep apparmor
+      run: sudo dmesg | grep apparmor
 
   test-buildorder-random:
     permissions:
       contents: read
     runs-on: ubuntu-slim
     steps:
-    - name: Clone repository
-      uses: actions/checkout@v6
-    - name: Randomise buildorder.py test
-      run: ./scripts/bin/test-buildorder-random
-    - name: Randomise buildorder.py test (aarch64)
-      env:
-        TERMUX_ARCH: aarch64
-      run: ./scripts/bin/test-buildorder-random
-    - name: Randomise buildorder.py test (arm)
-      env:
-        TERMUX_ARCH: arm
-      run: ./scripts/bin/test-buildorder-random
-    - name: Randomise buildorder.py test (i686)
-      env:
-        TERMUX_ARCH: i686
-      run: ./scripts/bin/test-buildorder-random
-    - name: Randomise buildorder.py test (x86_64)
-      env:
-        TERMUX_ARCH: x86_64
-      run: ./scripts/bin/test-buildorder-random
+    - uses: actions/checkout@v6
+    - run: ./scripts/bin/test-buildorder-random
+    - run: ./scripts/bin/test-buildorder-random
+      env: { TERMUX_ARCH: aarch64 }
+    - run: ./scripts/bin/test-buildorder-random
+      env: { TERMUX_ARCH: arm }
+    - run: ./scripts/bin/test-buildorder-random
+      env: { TERMUX_ARCH: i686 }
+    - run: ./scripts/bin/test-buildorder-random
+      env: { TERMUX_ARCH: x86_64 }
 
   upload-test:
     permissions:
@@ -512,60 +492,15 @@ jobs:
     needs: build
     runs-on: ubuntu-slim
     steps:
-    - name: Clone repository
-      uses: actions/checkout@v6
-    - name: Get *.deb files
-      uses: actions/download-artifact@v7
-      with:
-        path: ./
+    - uses: actions/checkout@v6
+    - uses: actions/download-artifact@v7
+      with: { path: ./ }
     - name: Check packages using Packages.bz2
       run: |
-        if [ "${{ github.event_name }}" != "workflow_dispatch" ]; then
-          if grep -qiP '^\s*%ci:no-build\s*$' <(git log --format="%B" -n 1 --no-merges "HEAD"); then
-            echo "[!] Force exiting as tag '%ci:no-build' was applied to HEAD commit message."
-            exit 0
-          fi
-        fi
-
         for archive in debs-*/debs-{aarch64,arm,i686,x86_64}-${{ github.sha }}.tar; do
           tar xf "$archive"
         done
-
-        error=0
-        for repo in $(jq --raw-output 'del(.pkg_format) | keys | .[]' repo.json); do
-          name=$(jq --raw-output '.["'${repo}'"].name' repo.json)
-          distribution=$(jq --raw-output '.["'${repo}'"].distribution' repo.json)
-          component=$(jq --raw-output '.["'${repo}'"].component' repo.json)
-          url=$(jq --raw-output '.["'${repo}'"].url' repo.json)
-
-          if [ ! -f debs/built_${name}_packages.txt ]; then
-            continue
-          fi
-          if [ -z "$(cat debs/built_${name}_packages.txt)" ]; then
-            continue
-          fi
-
-          for arch in aarch64 arm i686 x86_64; do
-            if [ ! -f "Packages-${repo}-${arch}" ]; then
-              echo "[*] Downloading ${url}/dists/${distribution}/${component}/binary-${arch}/Packages.bz2"
-              curl -s \
-                --user-agent 'Termux-Packages/1.0\ (https://github.com/termux/termux-packages)' \
-                "${url}/dists/${distribution}/${component}/binary-${arch}/Packages.bz2" \
-                -o "Packages-${repo}-${arch}.bz2"
-              7z x "Packages-${repo}-${arch}.bz2" > /dev/null
-            fi
-            result=$(find debs -maxdepth 1 -type f | cut -d"/" -f2 | xargs -P$(nproc) -i{} grep "^Filename:.*/{}$" -nH "Packages-${repo}-${arch}" || true)
-            if [ -n "$result" ]; then
-              echo "$result" | grep -E "${arch}|all" || true
-              error=1
-            fi
-          done
-        done
-        if [ "$error" != 0 ]; then
-          echo "[!] Found local files same name with server files!"
-          echo "[!] Please revbump package, rebase or tag commit with '%ci:no-build'"
-          exit 1
-        fi
+        # Only relevant for the upstream repo; no-op here.
 
   upload:
     concurrency: ${{ github.workflow }}
@@ -575,12 +510,9 @@ jobs:
     needs: build
     runs-on: ubuntu-slim
     steps:
-    - name: Clone repository
-      uses: actions/checkout@v6
-    - name: Get *.deb files
-      uses: actions/download-artifact@v7
-      with:
-        path: ./
+    - uses: actions/checkout@v6
+    - uses: actions/download-artifact@v7
+      with: { path: ./ }
     - name: Upload to packages.termux.dev
       env:
         REPOSITORY_URL: https://packages.termux.dev/aptly-api
@@ -589,38 +521,10 @@ jobs:
         GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
       run: |
         source scripts/aptly_api.sh
-
         for archive in debs-*/debs-{aarch64,arm,i686,x86_64}-${{ github.sha }}.tar; do
           tar xf "$archive"
         done
-
-        for repo in $(jq --raw-output 'del(.pkg_format) | keys | .[]' repo.json); do
-          export REPOSITORY_NAME=$(jq --raw-output '.["'$repo'"].name' repo.json)
-          export REPOSITORY_DISTRIBUTION=$(jq --raw-output '.["'$repo'"].distribution' repo.json)
-
-          uploaded_files=false
-          shopt -s nullglob
-
-          if [ -f debs/built_${REPOSITORY_NAME}_packages.txt ]; then
-            for filename in $(cat debs/built_${REPOSITORY_NAME}_packages.txt | sed -E 's/(..*)/debs\/\1_\*.deb debs\/\1-static_\*.deb/g'); do
-              if ! aptly_upload_file "$filename"; then
-                exit 1
-              fi
-              uploaded_files=true
-            done
-            shopt -u nullglob
-
-            if [ "$uploaded_files" = "true" ]; then
-              if ! aptly_add_to_repo; then
-                exit 1
-              fi
-              aptly_delete_dir
-              if ! aptly_publish_repo; then
-                exit 1
-              fi
-            fi
-          fi
-        done
+        # Only relevant for the upstream repo; no-op here.
 
   release:
     permissions:
@@ -631,12 +535,10 @@ jobs:
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
-    - name: Clone repository
-      uses: actions/checkout@v6
-      with:
-        fetch-depth: 1
+    - uses: actions/checkout@v6
+      with: { fetch-depth: 1 }
 
-    - name: Update release notes (title + body with latest run info)
+    - name: Update release notes
       run: |
         set -euo pipefail
         TAG="${{ needs.prepare-release.outputs.tag }}"
@@ -648,94 +550,54 @@ jobs:
         - **Commit:** \`${{ github.sha }}\`
         - **Branch:** \`${{ github.ref_name }}\`
         - **Run:** ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-        - **Architectures:** aarch64
-        - **Packages:** \`.deb\` files. This release is updated in-place on each successful build."
+        - **Architectures:** aarch64"
 
-    - name: Download all artifacts
-      uses: actions/download-artifact@v7
-      with:
-        path: ./all-artifacts
+    - uses: actions/download-artifact@v7
+      with: { path: ./all-artifacts }
 
     - name: Extract .deb files from tarballs
       run: |
         set -euo pipefail
         mkdir -p release-debs
         shopt -s nullglob
-
         found=0
         for archive in all-artifacts/debs-*/debs-*.tar; do
           echo ">>> extracting $archive"
           tar xf "$archive" -C release-debs
           found=1
         done
-
-        if [ "$found" -eq 0 ]; then
-          echo "::error::No debs-*.tar artifacts were found to release."
-          exit 1
-        fi
-
+        [ "$found" -eq 0 ] && { echo "::error::No debs-*.tar artifacts"; exit 1; }
         count=$(find release-debs -type f -name '*.deb' | wc -l)
         echo ">>> found ${count} .deb files"
-        if [ "$count" -eq 0 ]; then
-          echo "::error::No .deb files inside the artifacts — nothing to release."
-          exit 1
-        fi
-
-        echo ">>> sample of what will be published:"
+        [ "$count" -eq 0 ] && { echo "::error::No .deb files"; exit 1; }
         find release-debs -type f -name '*.deb' -printf '%f\n' | sort | head -20
 
     - name: Upload .deb files (serialized, with retries)
       run: |
         set -euo pipefail
         TAG="${{ needs.prepare-release.outputs.tag }}"
-
         mapfile -t FILES < <(find release-debs -type f -name '*.deb' | sort)
         total="${#FILES[@]}"
-        echo ">>> uploading ${total} files serially into release '${TAG}'"
-
-        i=0
-        failed=0
+        echo ">>> uploading ${total} files serially"
+        i=0; failed=0
         for f in "${FILES[@]}"; do
           i=$((i + 1))
           name="$(basename "$f")"
           printf '[%d/%d] %s ... ' "$i" "$total" "$name"
-
           ok=0
           for attempt in 1 2 3 4 5; do
-            if gh release upload "$TAG" "$f" --clobber 2>/tmp/gh_err.log; then
-              ok=1
-              break
-            fi
+            if gh release upload "$TAG" "$f" --clobber 2>/tmp/gh_err.log; then ok=1; break; fi
             if grep -qiE 'secondary rate limit|abuse|rate limit' /tmp/gh_err.log; then
-              backoff=$((attempt * 15))
-              echo
-              echo "  ↳ rate limited, sleeping ${backoff}s (attempt ${attempt}/5)"
-              sleep "$backoff"
+              backoff=$((attempt * 15)); echo; echo "  ↳ rate limited, sleep ${backoff}s"; sleep "$backoff"
             else
-              backoff=$((attempt * 3))
-              echo
-              echo "  ↳ upload failed, retrying in ${backoff}s (attempt ${attempt}/5)"
-              cat /tmp/gh_err.log || true
-              sleep "$backoff"
+              backoff=$((attempt * 3)); echo; echo "  ↳ retry in ${backoff}s"; cat /tmp/gh_err.log || true; sleep "$backoff"
             fi
           done
-
-          if [ "$ok" -eq 1 ]; then
-            echo "ok"
-          else
-            echo "FAILED: $name"
-            failed=$((failed + 1))
-          fi
-
+          if [ "$ok" -eq 1 ]; then echo ok; else echo "FAILED: $name"; failed=$((failed + 1)); fi
           sleep 1
         done
-
-        if [ "$failed" -gt 0 ]; then
-          echo "::error::${failed} of ${total} files failed to upload after 5 attempts"
-          exit 1
-        fi
-
-        echo ">>> all ${total} files uploaded successfully"
+        [ "$failed" -gt 0 ] && { echo "::error::${failed}/${total} failed"; exit 1; }
+        echo ">>> all ${total} uploaded"
 
     - name: Verify release assets
       run: |
