@@ -32,10 +32,6 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  # -------------------------------------------------------------------
-  # Runs FIRST, before the build even starts.
-  # Creates a release tagged with the current date/time (UTC).
-  # -------------------------------------------------------------------
   prepare-release:
     permissions:
       contents: write
@@ -55,7 +51,6 @@ jobs:
     - name: Compute release tag
       id: tag
       run: |
-        # Example: 2026.10.05-134530
         TAG="$(date -u +'%Y.%m.%d-%H%M%S')"
         echo "tag=${TAG}"       >> "$GITHUB_OUTPUT"
         echo "timestamp=${TAG}" >> "$GITHUB_OUTPUT"
@@ -74,8 +69,7 @@ jobs:
         - **Commit:** \`${{ github.sha }}\`
         - **Branch:** \`${{ github.ref_name }}\`
         - **Run:** ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-        - **Architectures:** aarch64
-        - **Packages:** \`.deb\` files." \
+        - **Architectures:** aarch64" \
           --target "${{ github.sha }}" \
           || { echo "::error::Failed to create release '$TAG'"; exit 1; }
 
@@ -113,10 +107,8 @@ jobs:
                 OLD_COMMIT=$(git fetch origin master >&2; git merge-base origin/master $HEAD_COMMIT)
               fi
             fi
-            echo "Processing commit range: ${OLD_COMMIT}..${HEAD_COMMIT}"
             CHANGED_FILES=$(git diff-tree --no-commit-id --name-only -r "${OLD_COMMIT}" "${HEAD_COMMIT}")
           else
-            echo "Processing pull request #${{ github.event.pull_request.number }}: ${BASE_COMMIT}..HEAD"
             CHANGED_FILES=$(git diff-tree --no-commit-id --name-only -r "${BASE_COMMIT}" "HEAD")
           fi
         fi
@@ -327,64 +319,72 @@ jobs:
         fi
 
         echo ">>> Found debs-deps at: $DEBS_DIR"
+        echo ""
 
         # ------------------------------------------------------------------
-        # Wire up /var/lib/dpkg so dpkg-query (invoked with NO --admindir
-        # by build-package.sh) reads the same database we install into.
-        # Without this, build-package.sh reads the host Ubuntu dpkg and
-        # rebuilds every single dep.
+        # Manual install: for each .deb, extract files to their real
+        # absolute paths (which are already correct inside the archive)
+        # and write the .list file that build-package.sh checks for.
+        #
+        # We do NOT use `dpkg -i`. Some Termux packages have preinst
+        # scripts that fail on the x86_64 host (they invoke aarch64
+        # binaries), which aborts dpkg mid-batch and leaves later
+        # packages unregistered. Doing it by hand avoids that entirely.
         # ------------------------------------------------------------------
-        if [ ! -e /var/lib/dpkg ]; then
-          if mkdir -p /var/lib/dpkg 2>/dev/null; then
-            rm -rf /var/lib/dpkg
-            ln -sfn "$PREFIX/var/lib/dpkg" /var/lib/dpkg || \
-              sudo ln -sfn "$PREFIX/var/lib/dpkg" /var/lib/dpkg || true
-          else
-            sudo mkdir -p /var/lib
-            sudo ln -sfn "$PREFIX/var/lib/dpkg" /var/lib/dpkg || true
+        count=0
+        failed=0
+        shopt -s nullglob
+        for deb in "$DEBS_DIR"/*.deb; do
+          pkg=$(dpkg-deb -f "$deb" Package)
+          ver=$(dpkg-deb -f "$deb" Version)
+          arch=$(dpkg-deb -f "$deb" Architecture)
+
+          # 1. Extract files to absolute paths (paths inside are already
+          #    /data/data/app.xodos2/files/usr/...). Use sudo in case
+          #    the prefix needs elevated writes.
+          if ! sudo dpkg-deb -x "$deb" / 2>/dev/null && ! dpkg-deb -x "$deb" / 2>/dev/null; then
+            echo "  !! FAILED to extract $pkg"
+            failed=$((failed + 1))
+            continue
           fi
-        fi
 
-        echo ">>> /var/lib/dpkg is now:"
-        ls -ld /var/lib/dpkg
+          # 2. Write .list file. Strip leading ./ and skip directory
+          #    entries. Every path inside is already absolute.
+          dpkg-deb --fsys-tarfile "$deb" 2>/dev/null \
+            | tar -tf - \
+            | grep -v '/$' \
+            | sed 's|^\./|/|' \
+            > "$PREFIX/var/lib/dpkg/info/${pkg}.list" || true
 
-        # Legacy Termux prefix stub (some preinst scripts shebang it)
-        mkdir -p /data/data/com.termux/files/usr/bin 2>/dev/null || true
+          # 3. Append a status entry (not strictly required by
+          #    build-package.sh, but harmless and helps debugging).
+          printf 'Package: %s\nStatus: install ok installed\nPriority: optional\nSection: misc\nInstalled-Size: 1\nMaintainer: builder\nArchitecture: %s\nVersion: %s\nDescription: pre-built dependency\n\n' \
+            "$pkg" "$arch" "$ver" \
+            >> "$PREFIX/var/lib/dpkg/status"
 
-        echo ""
-        echo ">>> Installing via dpkg -i (admindir=$PREFIX/var/lib/dpkg, instdir=/)"
-        dpkg \
-          --admindir="$PREFIX/var/lib/dpkg" \
-          --instdir=/ \
-          --force-all \
-          -i "$DEBS_DIR"/*.deb \
-          || echo ">>> dpkg -i returned non-zero (continuing)"
-
-        echo ""
-        echo ">>> Pass 2: dpkg --configure -a"
-        dpkg --admindir="$PREFIX/var/lib/dpkg" --instdir=/ --force-all --configure -a \
-          || echo ">>> dpkg --configure -a returned non-zero (continuing)"
+          count=$((count + 1))
+        done
+        echo ">>> Installed $count packages ($failed failed)"
 
         echo ""
-        echo ">>> Sanity — status counts:"
-        if [ -f "$PREFIX/var/lib/dpkg/status" ]; then
-          echo "  total:                $(grep -c '^Package:' "$PREFIX/var/lib/dpkg/status" || echo 0)"
-          echo "  install ok installed: $(grep -c '^Status: install ok installed' "$PREFIX/var/lib/dpkg/status" || echo 0)"
-          echo "  install ok unpacked:  $(grep -c '^Status: install ok unpacked' "$PREFIX/var/lib/dpkg/status" || echo 0)"
-        else
-          echo "  status file MISSING"
-        fi
+        echo ">>> What is actually in $PREFIX/var/lib/dpkg/info/ :"
+        echo "    total .list files: $(find "$PREFIX/var/lib/dpkg/info" -maxdepth 1 -name '*.list' | wc -l)"
+        echo "    sample (first 30):"
+        find "$PREFIX/var/lib/dpkg/info" -maxdepth 1 -name '*.list' -printf '      %f\n' | sort | head -30
 
         echo ""
-        echo ">>> dpkg-query with DEFAULT admindir (what build-package.sh sees):"
-        for c in libexpat openssl openssl-tool xorgproto xorg-util-macros libandroid-support libandroid-wordexp libbz2 libiconv libc++ python termux-tools; do
-          s=$(dpkg-query -W --showformat='${Status}' "$c" 2>/dev/null || true)
-          echo "  $c -> ${s:-NOT FOUND}"
+        echo ">>> The packages being rebuilt — do they have .list now?"
+        for c in ncurses readline libexpat openssl openssl-tool xorgproto xorg-util-macros libandroid-support libandroid-wordexp libbz2 libiconv libc++ zlib; do
+          if [ -f "$PREFIX/var/lib/dpkg/info/${c}.list" ]; then
+            echo "  ${c}.list OK ($(wc -l < "$PREFIX/var/lib/dpkg/info/${c}.list") entries)"
+          else
+            echo "  ${c}.list MISSING"
+          fi
         done
 
         echo ""
         echo ">>> Binaries on disk:"
-        for b in bash bzip2 openssl; do
+        for b in bash bzip2 openssl sh; do
           [ -x "$PREFIX/bin/$b" ] && echo "  $PREFIX/bin/$b OK" || echo "  $PREFIX/bin/$b MISSING"
         done
 
@@ -554,10 +554,6 @@ jobs:
           fi
         done
 
-  # -------------------------------------------------------------------
-  # Uploads artifacts into the release created by 'prepare-release'.
-  # Tag is a date-timestamp so every run creates a new release.
-  # -------------------------------------------------------------------
   release:
     permissions:
       contents: write
