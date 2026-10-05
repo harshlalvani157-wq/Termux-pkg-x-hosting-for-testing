@@ -369,9 +369,6 @@ jobs:
     # ------------------------------------------------------------------
     # Extract every .deb into the Termux prefix, then build the target
     # package WITHOUT -I. Deps are found by path, not by dpkg.
-    #
-    # The inner script is built line by line with echo so we don't hit
-    # YAML block-scalar / heredoc terminator indentation problems.
     # ------------------------------------------------------------------
     - name: Build packages
       if: ${{ steps.build-info.outputs.skip-building != 'true' }}
