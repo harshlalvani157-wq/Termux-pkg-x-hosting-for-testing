@@ -322,24 +322,27 @@ jobs:
         echo ""
 
         # ------------------------------------------------------------------
-        # Install the pre-built dependency .debs using dpkg -i.
-        # --instdir=/ extracts each package to its absolute paths, which
-        # are already correct inside the .deb (data/data/app.xodos2/...).
-        # --admindir= puts status + .list files under our prefix's dpkg
-        # directory, which is where build-package.sh looks for them.
+        # Tell every dpkg / dpkg-query invocation — including the ones
+        # build-package.sh makes internally to decide whether a dep is
+        # already installed — to use our prefix's database.
+        #
+        # Without this, build-package.sh's internal `dpkg-query` reads
+        # /var/lib/dpkg (Ubuntu's host database), sees nothing, and
+        # rebuilds every dep from source.
         # ------------------------------------------------------------------
+        export DPKG_ADMINDIR="$PREFIX/var/lib/dpkg"
+        echo ">>> DPKG_ADMINDIR=$DPKG_ADMINDIR"
+
         echo ">>> Installing via dpkg -i"
         dpkg \
-          --admindir="$PREFIX/var/lib/dpkg" \
           --instdir=/ \
           --force-all \
           -i "$DEBS_DIR"/*.deb \
           || echo ">>> dpkg -i returned non-zero (continuing)"
 
         echo ""
-        echo ">>> Pass 2: dpkg --configure -a (finish half-configured packages)"
+        echo ">>> Pass 2: dpkg --configure -a"
         dpkg \
-          --admindir="$PREFIX/var/lib/dpkg" \
           --instdir=/ \
           --force-all \
           --configure -a \
@@ -356,7 +359,14 @@ jobs:
         fi
 
         echo ""
-        echo ">>> Sanity — .list files for packages being rebuilt:"
+        echo ">>> Sanity — dpkg-query results (this is what build-package.sh will see):"
+        for c in ncurses readline libexpat openssl openssl-tool xorgproto xorg-util-macros libandroid-support libandroid-wordexp libbz2 libiconv libc++ zlib; do
+          st=$(dpkg-query -W --showformat='${Status}' "$c" 2>/dev/null || true)
+          printf '  %-25s -> %s\n' "$c" "${st:-NOT FOUND}"
+        done
+
+        echo ""
+        echo ">>> Sanity — .list files:"
         for c in ncurses readline libexpat openssl openssl-tool xorgproto xorg-util-macros libandroid-support libandroid-wordexp libbz2 libiconv libc++ zlib; do
           if [ -f "$PREFIX/var/lib/dpkg/info/${c}.list" ]; then
             echo "  ${c}.list OK ($(wc -l < "$PREFIX/var/lib/dpkg/info/${c}.list") entries)"
@@ -375,6 +385,8 @@ jobs:
         echo ">>> Building: __PKGS_PLACEHOLDER__"
         echo ""
 
+        # DPKG_ADMINDIR is exported, so all internal dpkg-query calls
+        # from build-package.sh will see our database.
         ./build-package.sh -C -a aarch64 __PKGS_PLACEHOLDER__
         INNER_EOF
 
