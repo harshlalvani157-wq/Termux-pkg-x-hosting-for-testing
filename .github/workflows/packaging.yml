@@ -32,6 +32,10 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  # -------------------------------------------------------------------
+  # Runs FIRST, before the build even starts.
+  # Creates a release tagged with the current date/time (UTC).
+  # -------------------------------------------------------------------
   prepare-release:
     permissions:
       contents: write
@@ -51,33 +55,29 @@ jobs:
     - name: Compute release tag
       id: tag
       run: |
-        TAG="latest"
-        TS="$(date -u +'%Y.%m.%d-%H%M%S')"
+        # Example: 2026.10.05-134530
+        TAG="$(date -u +'%Y.%m.%d-%H%M%S')"
         echo "tag=${TAG}"       >> "$GITHUB_OUTPUT"
-        echo "timestamp=${TS}"  >> "$GITHUB_OUTPUT"
-        echo ">>> release tag: ${TAG}  (this run: ${TS})"
+        echo "timestamp=${TAG}" >> "$GITHUB_OUTPUT"
+        echo ">>> release tag: ${TAG}"
 
-    - name: Create release if missing
+    - name: Create release
       run: |
         set -euo pipefail
         TAG="${{ steps.tag.outputs.tag }}"
-        if gh release view "$TAG" >/dev/null 2>&1; then
-          echo ">>> release '$TAG' already exists — will overwrite its assets"
-        else
-          echo ">>> creating release '$TAG'"
-          gh release create "$TAG" \
-            --title "Build ${{ steps.tag.outputs.timestamp }}" \
-            --notes "Automated package build.
+        echo ">>> creating release '$TAG'"
+        gh release create "$TAG" \
+          --title "Build $TAG" \
+          --notes "Automated package build.
 
-        - **Last update:** ${{ steps.tag.outputs.timestamp }} UTC
+        - **Created:** $TAG UTC
         - **Commit:** \`${{ github.sha }}\`
         - **Branch:** \`${{ github.ref_name }}\`
         - **Run:** ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         - **Architectures:** aarch64
-        - **Packages:** \`.deb\` files. This release is updated in-place on each successful build." \
-            --target "${{ github.sha }}" \
-            || { echo "::error::Failed to create release '$TAG'"; exit 1; }
-        fi
+        - **Packages:** \`.deb\` files." \
+          --target "${{ github.sha }}" \
+          || { echo "::error::Failed to create release '$TAG'"; exit 1; }
 
   build:
     permissions:
@@ -113,8 +113,10 @@ jobs:
                 OLD_COMMIT=$(git fetch origin master >&2; git merge-base origin/master $HEAD_COMMIT)
               fi
             fi
+            echo "Processing commit range: ${OLD_COMMIT}..${HEAD_COMMIT}"
             CHANGED_FILES=$(git diff-tree --no-commit-id --name-only -r "${OLD_COMMIT}" "${HEAD_COMMIT}")
           else
+            echo "Processing pull request #${{ github.event.pull_request.number }}: ${BASE_COMMIT}..HEAD"
             CHANGED_FILES=$(git diff-tree --no-commit-id --name-only -r "${BASE_COMMIT}" "HEAD")
           fi
         fi
@@ -201,9 +203,9 @@ jobs:
         fi
 
         for repo in $(jq --raw-output 'del(.pkg_format) | .[].name' repo.json); do
-          [ -f ./built_${repo}_packages.txt ]     && sort ./built_${repo}_packages.txt     | uniq > ./tmp && mv ./tmp ./built_${repo}_packages.txt
-          [ -f ./built_${repo}_subpackages.txt ]  && sort ./built_${repo}_subpackages.txt  | uniq > ./tmp && mv ./tmp ./built_${repo}_subpackages.txt
-          [ -f ./deleted_${repo}_packages.txt ]   && sort ./deleted_${repo}_packages.txt   | uniq > ./tmp && mv ./tmp ./deleted_${repo}_packages.txt
+          [ -f ./built_${repo}_packages.txt ]    && { sort ./built_${repo}_packages.txt | uniq > ./tmp && mv ./tmp ./built_${repo}_packages.txt; }
+          [ -f ./built_${repo}_subpackages.txt ] && { sort ./built_${repo}_subpackages.txt | uniq > ./tmp && mv ./tmp ./built_${repo}_subpackages.txt; }
+          [ -f ./deleted_${repo}_packages.txt ]  && { sort ./deleted_${repo}_packages.txt | uniq > ./tmp && mv ./tmp ./deleted_${repo}_packages.txt; }
         done
 
         declare -a packages=()
@@ -301,39 +303,6 @@ jobs:
 
         mkdir -p "$PREFIX/var/lib/dpkg/info"
 
-        # ------------------------------------------------------------------
-        # THE FIX
-        #
-        # build-package.sh internally calls `dpkg-query` with NO --admindir.
-        # That reads /var/lib/dpkg by default. We install into
-        # $PREFIX/var/lib/dpkg, so without this symlink every dependency
-        # looks "not installed" and gets rebuilt from source.
-        #
-        # Making /var/lib/dpkg a symlink to $PREFIX/var/lib/dpkg is what
-        # tells build-package.sh everything really is installed.
-        # ------------------------------------------------------------------
-        if [ -L /var/lib/dpkg ]; then
-          echo ">>> /var/lib/dpkg is already a symlink -> $(readlink /var/lib/dpkg)"
-        elif [ -d /var/lib/dpkg ]; then
-          echo ">>> /var/lib/dpkg exists as a real directory. Backing it up."
-          sudo mv /var/lib/dpkg /var/lib/dpkg.orig 2>/dev/null || true
-          sudo mkdir -p /var/lib
-          sudo ln -sfn "$PREFIX/var/lib/dpkg" /var/lib/dpkg
-        else
-          sudo mkdir -p /var/lib
-          sudo ln -sfn "$PREFIX/var/lib/dpkg" /var/lib/dpkg
-        fi
-
-        echo ">>> /var/lib/dpkg -> $(readlink /var/lib/dpkg 2>/dev/null || echo 'NOT A SYMLINK')"
-
-        # Pre-create the classic termux prefix so preinst shebangs like
-        #   #!/data/data/com.termux/files/usr/bin/sh
-        # resolve to *something*. The interpreter inside is empty, so any
-        # script that actually tries to run through it will still fail —
-        # but that failure is caught by dpkg and does not abort the batch.
-        mkdir -p /data/data/com.termux/files/usr/bin 2>/dev/null || true
-
-        # Locate debs-deps
         DEBS_DIR=""
         for candidate in \
           "$PWD/debs-deps" \
@@ -354,59 +323,70 @@ jobs:
           echo ">>> WARNING: debs-deps not found."
           ls -la | head -40
           find / -maxdepth 6 -type d -name debs-deps 2>/dev/null || true
-        else
-          echo ">>> Found debs-deps at: $DEBS_DIR"
-
-          echo ""
-          echo ">>> Pass 1: dpkg -i (unpack + configure)"
-          dpkg \
-            --admindir="$PREFIX/var/lib/dpkg" \
-            --instdir=/ \
-            --force-all \
-            --log=/tmp/dpkg-ini.log \
-            -i "$DEBS_DIR"/*.deb \
-            || echo ">>> dpkg -i returned non-zero (continuing)"
-
-          echo ""
-          echo ">>> Pass 2: dpkg --configure -a"
-          dpkg \
-            --admindir="$PREFIX/var/lib/dpkg" \
-            --instdir=/ \
-            --force-all \
-            --log=/tmp/dpkg-config.log \
-            --configure -a \
-            || echo ">>> dpkg --configure -a returned non-zero (continuing)"
-
-          echo ""
-          echo ">>> Sanity — status counts:"
-          if [ -f "$PREFIX/var/lib/dpkg/status" ]; then
-            echo "  total:                $(grep -c '^Package:' "$PREFIX/var/lib/dpkg/status" || echo 0)"
-            echo "  install ok installed: $(grep -c '^Status: install ok installed' "$PREFIX/var/lib/dpkg/status" || echo 0)"
-            echo "  install ok unpacked:  $(grep -c '^Status: install ok unpacked' "$PREFIX/var/lib/dpkg/status" || echo 0)"
-          else
-            echo "  status file MISSING"
-          fi
-
-          echo ""
-          echo ">>> dpkg-query with DEFAULT admindir (what build-package.sh sees):"
-          for c in libexpat openssl openssl-tool xorgproto xorg-util-macros libandroid-support libbz2 libiconv libc++ termux-tools python; do
-            s=$(dpkg-query -W --showformat='${Status}' "$c" 2>/dev/null || true)
-            echo "  $c -> ${s:-NOT FOUND}"
-          done
-
-          echo ""
-          echo ">>> dpkg-query with PREFIX admindir (what we installed):"
-          for c in libexpat openssl openssl-tool xorgproto xorg-util-macros libandroid-support libbz2 libiconv libc++ termux-tools python; do
-            s=$(dpkg-query --admindir="$PREFIX/var/lib/dpkg" -W --showformat='${Status}' "$c" 2>/dev/null || true)
-            echo "  $c -> ${s:-NOT FOUND}"
-          done
-
-          echo ""
-          echo ">>> Binaries on disk:"
-          for b in bash bzip2 openssl; do
-            [ -x "$PREFIX/bin/$b" ] && echo "  $PREFIX/bin/$b OK" || echo "  $PREFIX/bin/$b MISSING"
-          done
+          exit 1
         fi
+
+        echo ">>> Found debs-deps at: $DEBS_DIR"
+
+        # ------------------------------------------------------------------
+        # Wire up /var/lib/dpkg so dpkg-query (invoked with NO --admindir
+        # by build-package.sh) reads the same database we install into.
+        # Without this, build-package.sh reads the host Ubuntu dpkg and
+        # rebuilds every single dep.
+        # ------------------------------------------------------------------
+        if [ ! -e /var/lib/dpkg ]; then
+          if mkdir -p /var/lib/dpkg 2>/dev/null; then
+            rm -rf /var/lib/dpkg
+            ln -sfn "$PREFIX/var/lib/dpkg" /var/lib/dpkg || \
+              sudo ln -sfn "$PREFIX/var/lib/dpkg" /var/lib/dpkg || true
+          else
+            sudo mkdir -p /var/lib
+            sudo ln -sfn "$PREFIX/var/lib/dpkg" /var/lib/dpkg || true
+          fi
+        fi
+
+        echo ">>> /var/lib/dpkg is now:"
+        ls -ld /var/lib/dpkg
+
+        # Legacy Termux prefix stub (some preinst scripts shebang it)
+        mkdir -p /data/data/com.termux/files/usr/bin 2>/dev/null || true
+
+        echo ""
+        echo ">>> Installing via dpkg -i (admindir=$PREFIX/var/lib/dpkg, instdir=/)"
+        dpkg \
+          --admindir="$PREFIX/var/lib/dpkg" \
+          --instdir=/ \
+          --force-all \
+          -i "$DEBS_DIR"/*.deb \
+          || echo ">>> dpkg -i returned non-zero (continuing)"
+
+        echo ""
+        echo ">>> Pass 2: dpkg --configure -a"
+        dpkg --admindir="$PREFIX/var/lib/dpkg" --instdir=/ --force-all --configure -a \
+          || echo ">>> dpkg --configure -a returned non-zero (continuing)"
+
+        echo ""
+        echo ">>> Sanity — status counts:"
+        if [ -f "$PREFIX/var/lib/dpkg/status" ]; then
+          echo "  total:                $(grep -c '^Package:' "$PREFIX/var/lib/dpkg/status" || echo 0)"
+          echo "  install ok installed: $(grep -c '^Status: install ok installed' "$PREFIX/var/lib/dpkg/status" || echo 0)"
+          echo "  install ok unpacked:  $(grep -c '^Status: install ok unpacked' "$PREFIX/var/lib/dpkg/status" || echo 0)"
+        else
+          echo "  status file MISSING"
+        fi
+
+        echo ""
+        echo ">>> dpkg-query with DEFAULT admindir (what build-package.sh sees):"
+        for c in libexpat openssl openssl-tool xorgproto xorg-util-macros libandroid-support libandroid-wordexp libbz2 libiconv libc++ python termux-tools; do
+          s=$(dpkg-query -W --showformat='${Status}' "$c" 2>/dev/null || true)
+          echo "  $c -> ${s:-NOT FOUND}"
+        done
+
+        echo ""
+        echo ">>> Binaries on disk:"
+        for b in bash bzip2 openssl; do
+          [ -x "$PREFIX/bin/$b" ] && echo "  $PREFIX/bin/$b OK" || echo "  $PREFIX/bin/$b MISSING"
+        done
 
         echo ""
         echo ">>> Building: __PKGS_PLACEHOLDER__"
@@ -497,10 +477,41 @@ jobs:
       with: { path: ./ }
     - name: Check packages using Packages.bz2
       run: |
+        if [ "${{ github.event_name }}" != "workflow_dispatch" ]; then
+          if grep -qiP '^\s*%ci:no-build\s*$' <(git log --format="%B" -n 1 --no-merges "HEAD"); then
+            echo "[!] Force exiting as tag '%ci:no-build'."
+            exit 0
+          fi
+        fi
         for archive in debs-*/debs-{aarch64,arm,i686,x86_64}-${{ github.sha }}.tar; do
           tar xf "$archive"
         done
-        # Only relevant for the upstream repo; no-op here.
+        error=0
+        for repo in $(jq --raw-output 'del(.pkg_format) | keys | .[]' repo.json); do
+          name=$(jq --raw-output '.["'${repo}'"].name' repo.json)
+          distribution=$(jq --raw-output '.["'${repo}'"].distribution' repo.json)
+          component=$(jq --raw-output '.["'${repo}'"].component' repo.json)
+          url=$(jq --raw-output '.["'${repo}'"].url' repo.json)
+          [ ! -f debs/built_${name}_packages.txt ] && continue
+          [ -z "$(cat debs/built_${name}_packages.txt)" ] && continue
+          for arch in aarch64 arm i686 x86_64; do
+            if [ ! -f "Packages-${repo}-${arch}" ]; then
+              curl -s --user-agent 'Termux-Packages/1.0' \
+                "${url}/dists/${distribution}/${component}/binary-${arch}/Packages.bz2" \
+                -o "Packages-${repo}-${arch}.bz2"
+              7z x "Packages-${repo}-${arch}.bz2" > /dev/null
+            fi
+            result=$(find debs -maxdepth 1 -type f | cut -d"/" -f2 | xargs -P$(nproc) -i{} grep "^Filename:.*/{}$" -nH "Packages-${repo}-${arch}" || true)
+            if [ -n "$result" ]; then
+              echo "$result" | grep -E "${arch}|all" || true
+              error=1
+            fi
+          done
+        done
+        if [ "$error" != 0 ]; then
+          echo "[!] Found local files same name with server files!"
+          exit 1
+        fi
 
   upload:
     concurrency: ${{ github.workflow }}
@@ -524,8 +535,29 @@ jobs:
         for archive in debs-*/debs-{aarch64,arm,i686,x86_64}-${{ github.sha }}.tar; do
           tar xf "$archive"
         done
-        # Only relevant for the upstream repo; no-op here.
+        for repo in $(jq --raw-output 'del(.pkg_format) | keys | .[]' repo.json); do
+          export REPOSITORY_NAME=$(jq --raw-output '.["'$repo'"].name' repo.json)
+          export REPOSITORY_DISTRIBUTION=$(jq --raw-output '.["'$repo'"].distribution' repo.json)
+          uploaded_files=false
+          shopt -s nullglob
+          if [ -f debs/built_${REPOSITORY_NAME}_packages.txt ]; then
+            for filename in $(cat debs/built_${REPOSITORY_NAME}_packages.txt | sed -E 's/(..*)/debs\/\1_\*.deb debs\/\1-static_\*.deb/g'); do
+              if ! aptly_upload_file "$filename"; then exit 1; fi
+              uploaded_files=true
+            done
+            shopt -u nullglob
+            if [ "$uploaded_files" = "true" ]; then
+              if ! aptly_add_to_repo; then exit 1; fi
+              aptly_delete_dir
+              if ! aptly_publish_repo; then exit 1; fi
+            fi
+          fi
+        done
 
+  # -------------------------------------------------------------------
+  # Uploads artifacts into the release created by 'prepare-release'.
+  # Tag is a date-timestamp so every run creates a new release.
+  # -------------------------------------------------------------------
   release:
     permissions:
       contents: write
@@ -537,20 +569,6 @@ jobs:
     steps:
     - uses: actions/checkout@v6
       with: { fetch-depth: 1 }
-
-    - name: Update release notes
-      run: |
-        set -euo pipefail
-        TAG="${{ needs.prepare-release.outputs.tag }}"
-        gh release edit "$TAG" \
-          --title "Build ${{ needs.prepare-release.outputs.timestamp }}" \
-          --notes "Automated package build.
-
-        - **Last update:** ${{ needs.prepare-release.outputs.timestamp }} UTC
-        - **Commit:** \`${{ github.sha }}\`
-        - **Branch:** \`${{ github.ref_name }}\`
-        - **Run:** ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-        - **Architectures:** aarch64"
 
     - uses: actions/download-artifact@v7
       with: { path: ./all-artifacts }
@@ -578,7 +596,7 @@ jobs:
         TAG="${{ needs.prepare-release.outputs.tag }}"
         mapfile -t FILES < <(find release-debs -type f -name '*.deb' | sort)
         total="${#FILES[@]}"
-        echo ">>> uploading ${total} files serially"
+        echo ">>> uploading ${total} files serially into release '${TAG}'"
         i=0; failed=0
         for f in "${FILES[@]}"; do
           i=$((i + 1))
