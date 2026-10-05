@@ -322,58 +322,41 @@ jobs:
         echo ""
 
         # ------------------------------------------------------------------
-        # Manual install: for each .deb, extract files to their real
-        # absolute paths (which are already correct inside the archive)
-        # and write the .list file that build-package.sh checks for.
-        #
-        # We do NOT use `dpkg -i`. Some Termux packages have preinst
-        # scripts that fail on the x86_64 host (they invoke aarch64
-        # binaries), which aborts dpkg mid-batch and leaves later
-        # packages unregistered. Doing it by hand avoids that entirely.
+        # Install the pre-built dependency .debs using dpkg -i.
+        # --instdir=/ extracts each package to its absolute paths, which
+        # are already correct inside the .deb (data/data/app.xodos2/...).
+        # --admindir= puts status + .list files under our prefix's dpkg
+        # directory, which is where build-package.sh looks for them.
         # ------------------------------------------------------------------
-        count=0
-        failed=0
-        shopt -s nullglob
-        for deb in "$DEBS_DIR"/*.deb; do
-          pkg=$(dpkg-deb -f "$deb" Package)
-          ver=$(dpkg-deb -f "$deb" Version)
-          arch=$(dpkg-deb -f "$deb" Architecture)
-
-          # 1. Extract files to absolute paths (paths inside are already
-          #    /data/data/app.xodos2/files/usr/...). Use sudo in case
-          #    the prefix needs elevated writes.
-          if ! sudo dpkg-deb -x "$deb" / 2>/dev/null && ! dpkg-deb -x "$deb" / 2>/dev/null; then
-            echo "  !! FAILED to extract $pkg"
-            failed=$((failed + 1))
-            continue
-          fi
-
-          # 2. Write .list file. Strip leading ./ and skip directory
-          #    entries. Every path inside is already absolute.
-          dpkg-deb --fsys-tarfile "$deb" 2>/dev/null \
-            | tar -tf - \
-            | grep -v '/$' \
-            | sed 's|^\./|/|' \
-            > "$PREFIX/var/lib/dpkg/info/${pkg}.list" || true
-
-          # 3. Append a status entry (not strictly required by
-          #    build-package.sh, but harmless and helps debugging).
-          printf 'Package: %s\nStatus: install ok installed\nPriority: optional\nSection: misc\nInstalled-Size: 1\nMaintainer: builder\nArchitecture: %s\nVersion: %s\nDescription: pre-built dependency\n\n' \
-            "$pkg" "$arch" "$ver" \
-            >> "$PREFIX/var/lib/dpkg/status"
-
-          count=$((count + 1))
-        done
-        echo ">>> Installed $count packages ($failed failed)"
+        echo ">>> Installing via dpkg -i"
+        dpkg \
+          --admindir="$PREFIX/var/lib/dpkg" \
+          --instdir=/ \
+          --force-all \
+          -i "$DEBS_DIR"/*.deb \
+          || echo ">>> dpkg -i returned non-zero (continuing)"
 
         echo ""
-        echo ">>> What is actually in $PREFIX/var/lib/dpkg/info/ :"
-        echo "    total .list files: $(find "$PREFIX/var/lib/dpkg/info" -maxdepth 1 -name '*.list' | wc -l)"
-        echo "    sample (first 30):"
-        find "$PREFIX/var/lib/dpkg/info" -maxdepth 1 -name '*.list' -printf '      %f\n' | sort | head -30
+        echo ">>> Pass 2: dpkg --configure -a (finish half-configured packages)"
+        dpkg \
+          --admindir="$PREFIX/var/lib/dpkg" \
+          --instdir=/ \
+          --force-all \
+          --configure -a \
+          || echo ">>> dpkg --configure -a returned non-zero (continuing)"
 
         echo ""
-        echo ">>> The packages being rebuilt — do they have .list now?"
+        echo ">>> Sanity — status counts:"
+        if [ -f "$PREFIX/var/lib/dpkg/status" ]; then
+          echo "  total:                $(grep -c '^Package:' "$PREFIX/var/lib/dpkg/status" || echo 0)"
+          echo "  install ok installed: $(grep -c '^Status: install ok installed' "$PREFIX/var/lib/dpkg/status" || echo 0)"
+          echo "  install ok unpacked:  $(grep -c '^Status: install ok unpacked' "$PREFIX/var/lib/dpkg/status" || echo 0)"
+        else
+          echo "  status file MISSING"
+        fi
+
+        echo ""
+        echo ">>> Sanity — .list files for packages being rebuilt:"
         for c in ncurses readline libexpat openssl openssl-tool xorgproto xorg-util-macros libandroid-support libandroid-wordexp libbz2 libiconv libc++ zlib; do
           if [ -f "$PREFIX/var/lib/dpkg/info/${c}.list" ]; then
             echo "  ${c}.list OK ($(wc -l < "$PREFIX/var/lib/dpkg/info/${c}.list") entries)"
