@@ -72,12 +72,6 @@ jobs:
       with:
         fetch-depth: 1000
 
-    # ==================================================================
-    # PATCH properties.sh ON THE HOST, before docker ever runs.
-    # The workspace is bind-mounted into the container, so the patched
-    # file is what build-package.sh sees. This is the essential fix:
-    # make TERMUX_REPO_APP__PACKAGE_NAME match TERMUX_APP__PACKAGE_NAME.
-    # ==================================================================
     - name: Patch properties.sh
       run: |
         set -euo pipefail
@@ -117,7 +111,6 @@ jobs:
         echo ">>> Patched TERMUX_REPO_* values:"
         grep -nE '^TERMUX_REPO_APP__|^TERMUX_REPO__' "$PROPS" || true
 
-        # Verify
         NEW_NAME=$(grep -E '^TERMUX_REPO_APP__PACKAGE_NAME=' "$PROPS" | cut -d'"' -f2)
         if [ "$NEW_NAME" != "$APP_PKG" ]; then
           echo "::error::patch failed — TERMUX_REPO_APP__PACKAGE_NAME is still '$NEW_NAME', expected '$APP_PKG'"
@@ -290,6 +283,12 @@ jobs:
       if: ${{ steps.build-info.outputs.free-space == 'true' && steps.build-info.outputs.skip-building != 'true' }}
       run: ./scripts/free-space.sh
 
+    # ==================================================================
+    # Download .deb assets from MULTIPLE releases.
+    # Order matters: the LAST release listed wins on filename collisions.
+    # Release 2026.10.06 has the newer LLVM/libllvm build, so it is
+    # listed second → its files overwrite the same names from 2026.10.03.
+    # ==================================================================
     - name: Download pre-built dependencies
       if: ${{ steps.build-info.outputs.skip-building != 'true' }}
       env:
@@ -297,13 +296,39 @@ jobs:
       run: |
         set -euo pipefail
         mkdir -p debs-deps
-        echo ">>> Downloading pre-built .deb files from release 2026.10.03-230607"
-        gh release download 2026.10.03-230607 \
-          -p "*.deb" \
-          -D debs-deps \
-          --repo "${{ github.repository }}" \
-          || echo "::warning::No .deb assets found in that release."
-        echo ">>> Downloaded $(find debs-deps -name '*.deb' | wc -l) .deb files."
+
+        # Later entries in this list override earlier ones for the same filename.
+        RELEASES=(
+          "2026.10.03-230607"
+          "2026.10.06-123109"
+        )
+
+        for tag in "${RELEASES[@]}"; do
+          echo ">>> Downloading .deb files from release $tag"
+          tmpdir="$(mktemp -d)"
+          if gh release download "$tag" \
+                -p "*.deb" \
+                -D "$tmpdir" \
+                --repo "${{ github.repository }}" \
+                2>/dev/null; then
+            shopt -s nullglob
+            files=("$tmpdir"/*.deb)
+            shopt -u nullglob
+            echo "    got ${#files[@]} files from $tag"
+            # Move with overwrite → later releases replace same-named files.
+            for f in "${files[@]}"; do
+              mv -f "$f" debs-deps/
+            done
+          else
+            echo "    (no .deb assets in release $tag — skipping)"
+          fi
+          rm -rf "$tmpdir"
+        done
+
+        count=$(find debs-deps -maxdepth 1 -name '*.deb' | wc -l)
+        echo ">>> Total unique .deb files in debs-deps: ${count}"
+        echo ">>> Sample filenames:"
+        find debs-deps -maxdepth 1 -name '*.deb' -printf '    %f\n' | sort | head -20
 
     - name: Build packages
       if: ${{ steps.build-info.outputs.skip-building != 'true' }}
@@ -346,13 +371,9 @@ jobs:
         fi
         echo ">>> Found debs-deps at: $DEBS_DIR"
         echo ">>> Sample filenames:"
-        find "$DEBS_DIR" -name '*.deb' -printf '    %f\n' | sort | head -15
+        find "$DEBS_DIR" -name '*.deb' -printf '    %f\n' | sort | head -20
         echo ""
 
-        # --------------------------------------------------------------
-        # Confirm the workspace properties.sh (patched on host) is the
-        # one that build-package.sh will source.
-        # --------------------------------------------------------------
         PROPS="/home/builder/termux-packages/scripts/properties.sh"
         if [ -f "$PROPS" ]; then
           echo ">>> Confirm properties.sh inside container:"
@@ -371,7 +392,7 @@ jobs:
 
         echo ""
         echo ">>> dpkg-query sample:"
-        for c in libexpat openssl ncurses readline libandroid-support zlib; do
+        for c in libexpat openssl ncurses readline libandroid-support zlib libllvm llvm; do
           st=$(dpkg-query -W --showformat='${Status}' "$c" 2>/dev/null || true)
           printf '  %-25s -> %s\n' "$c" "${st:-NOT FOUND}"
         done
@@ -380,8 +401,6 @@ jobs:
         echo ">>> Building: __PKGS_PLACEHOLDER__"
         echo ""
 
-        # -I tells build-package.sh: use the repo when a dep is missing.
-        # With matching names in properties.sh, this flag is honoured.
         ./build-package.sh -I -C -a aarch64 __PKGS_PLACEHOLDER__
         INNER_EOF
 
