@@ -290,6 +290,7 @@ jobs:
           "2026.10.06-161453"
           "2026.10.03-213828"
           "2026.10.03-223715"
+          "2026.10.06-161453"
         )
         for tag in "${RELEASES[@]}"; do
           echo ">>> Downloading .deb files from release $tag"
