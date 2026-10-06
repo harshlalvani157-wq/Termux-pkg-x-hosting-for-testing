@@ -72,23 +72,22 @@ jobs:
       with:
         fetch-depth: 1000
 
+    # ==================================================================
+    # PATCH 1 — properties.sh: make TERMUX_REPO_* match our custom prefix
+    # so build-package.sh -I is not silently disabled.
+    # ==================================================================
     - name: Patch properties.sh
       run: |
         set -euo pipefail
         PROPS="scripts/properties.sh"
         if [ ! -f "$PROPS" ]; then
-          echo "::error::scripts/properties.sh not found at $PROPS"
+          echo "::error::scripts/properties.sh not found"
           exit 1
         fi
 
-        echo ">>> Current TERMUX_REPO_* values:"
-        grep -nE '^TERMUX_REPO_APP__|^TERMUX_REPO__' "$PROPS" || true
-        echo ">>> Current TERMUX_APP__PACKAGE_NAME:"
-        grep -nE '^TERMUX_APP__PACKAGE_NAME=' "$PROPS" || true
-
         APP_PKG=$(grep -E '^TERMUX_APP__PACKAGE_NAME=' "$PROPS" | head -1 | cut -d'"' -f2)
         if [ -z "$APP_PKG" ]; then
-          echo "::error::Could not extract TERMUX_APP__PACKAGE_NAME from properties.sh"
+          echo "::error::Could not extract TERMUX_APP__PACKAGE_NAME"
           exit 1
         fi
         echo ">>> Detected app package name: $APP_PKG"
@@ -107,16 +106,39 @@ jobs:
           -e "s|^TERMUX_REPO__PREFIX=.*|TERMUX_REPO__PREFIX=\"${PREFIX}\"|" \
           "$PROPS"
 
-        echo ""
         echo ">>> Patched TERMUX_REPO_* values:"
         grep -nE '^TERMUX_REPO_APP__|^TERMUX_REPO__' "$PROPS" || true
 
-        NEW_NAME=$(grep -E '^TERMUX_REPO_APP__PACKAGE_NAME=' "$PROPS" | cut -d'"' -f2)
-        if [ "$NEW_NAME" != "$APP_PKG" ]; then
-          echo "::error::patch failed — TERMUX_REPO_APP__PACKAGE_NAME is still '$NEW_NAME', expected '$APP_PKG'"
+    # ==================================================================
+    # PATCH 2 — termux_download_deb_pac.sh: force it to always fail,
+    # so build-package.sh falls back to source-building missing deps
+    # instead of pulling them from the official Termux repos (which
+    # have the wrong prefix baked in).
+    #
+    # Deps that ARE already registered in dpkg (.list + status) are
+    # skipped before this function is ever called, so nothing gets
+    # rebuilt unnecessarily.
+    # ==================================================================
+    - name: Patch termux_download_deb_pac.sh
+      run: |
+        set -euo pipefail
+        TDP="scripts/build/termux_download_deb_pac.sh"
+        if [ ! -f "$TDP" ]; then
+          echo "::error::$TDP not found"
           exit 1
         fi
-        echo ">>> properties.sh patch OK"
+
+        # Insert a "return 1" right after the function's opening line.
+        # Also mark the function with a comment for grep-ability.
+        if grep -q 'FORCED-BY-CI-FORCE-SOURCE-BUILD' "$TDP"; then
+          echo ">>> Already patched"
+        else
+          sed -i '/^termux_download_deb_pac() {/a\    # FORCED-BY-CI-FORCE-SOURCE-BUILD: return failure so build-package.sh builds from source\n    return 1' "$TDP"
+          echo ">>> Patched $TDP"
+        fi
+
+        echo ">>> Verify:"
+        grep -n -A2 'termux_download_deb_pac() {' "$TDP" | head -10
 
     - name: Gather build summary
       id: build-info
@@ -283,12 +305,6 @@ jobs:
       if: ${{ steps.build-info.outputs.free-space == 'true' && steps.build-info.outputs.skip-building != 'true' }}
       run: ./scripts/free-space.sh
 
-    # ==================================================================
-    # Download .deb assets from MULTIPLE releases.
-    # Order matters: the LAST release listed wins on filename collisions.
-    # Release 2026.10.06 has the newer LLVM/libllvm build, so it is
-    # listed second → its files overwrite the same names from 2026.10.03.
-    # ==================================================================
     - name: Download pre-built dependencies
       if: ${{ steps.build-info.outputs.skip-building != 'true' }}
       env:
@@ -296,39 +312,29 @@ jobs:
       run: |
         set -euo pipefail
         mkdir -p debs-deps
-
-        # Later entries in this list override earlier ones for the same filename.
         RELEASES=(
           "2026.10.03-230607"
           "2026.10.06-123109"
+          "2026.10.06-153019"
+          "2026.10.03-213828"
+          "2026.10.03-223715"
         )
-
         for tag in "${RELEASES[@]}"; do
           echo ">>> Downloading .deb files from release $tag"
           tmpdir="$(mktemp -d)"
-          if gh release download "$tag" \
-                -p "*.deb" \
-                -D "$tmpdir" \
-                --repo "${{ github.repository }}" \
-                2>/dev/null; then
+          if gh release download "$tag" -p "*.deb" -D "$tmpdir" --repo "${{ github.repository }}" 2>/dev/null; then
             shopt -s nullglob
             files=("$tmpdir"/*.deb)
             shopt -u nullglob
             echo "    got ${#files[@]} files from $tag"
-            # Move with overwrite → later releases replace same-named files.
-            for f in "${files[@]}"; do
-              mv -f "$f" debs-deps/
-            done
+            for f in "${files[@]}"; do mv -f "$f" debs-deps/; done
           else
             echo "    (no .deb assets in release $tag — skipping)"
           fi
           rm -rf "$tmpdir"
         done
-
         count=$(find debs-deps -maxdepth 1 -name '*.deb' | wc -l)
         echo ">>> Total unique .deb files in debs-deps: ${count}"
-        echo ">>> Sample filenames:"
-        find debs-deps -maxdepth 1 -name '*.deb' -printf '    %f\n' | sort | head -20
 
     - name: Build packages
       if: ${{ steps.build-info.outputs.skip-building != 'true' }}
@@ -362,22 +368,23 @@ jobs:
             DEBS_DIR="$candidate"; break
           fi
         done
-
         if [ -z "$DEBS_DIR" ]; then
           echo ">>> WARNING: debs-deps not found."
-          ls -la | head -40
           find / -maxdepth 6 -type d -name debs-deps 2>/dev/null || true
           exit 1
         fi
         echo ">>> Found debs-deps at: $DEBS_DIR"
-        echo ">>> Sample filenames:"
-        find "$DEBS_DIR" -name '*.deb' -printf '    %f\n' | sort | head -20
         echo ""
 
         PROPS="/home/builder/termux-packages/scripts/properties.sh"
         if [ -f "$PROPS" ]; then
           echo ">>> Confirm properties.sh inside container:"
           grep -nE '^TERMUX_REPO_APP__PACKAGE_NAME=|^TERMUX_APP__PACKAGE_NAME=' "$PROPS" || true
+        fi
+        TDP="/home/builder/termux-packages/scripts/build/termux_download_deb_pac.sh"
+        if [ -f "$TDP" ]; then
+          echo ">>> Confirm termux_download_deb_pac.sh is patched:"
+          grep -n 'FORCED-BY-CI-FORCE-SOURCE-BUILD' "$TDP" || echo "  (patch not present)"
         fi
         echo ""
 
@@ -401,6 +408,9 @@ jobs:
         echo ">>> Building: __PKGS_PLACEHOLDER__"
         echo ""
 
+        # -I is honored now (properties patched). Deps already in dpkg
+        # are skipped via .list check. Deps NOT in dpkg: the patched
+        # termux_download_deb_pac forces a source build for them.
         ./build-package.sh -I -C -a aarch64 __PKGS_PLACEHOLDER__
         INNER_EOF
 
@@ -431,6 +441,40 @@ jobs:
         done
         echo ">>> debs/ contains: $(find debs -type f -name '*.deb' | wc -l) .deb files"
         tar cf artifacts/debs-${{ matrix.target_arch }}-${{ github.sha }}.tar debs
+
+    # ==================================================================
+    # FAIL THE WORKFLOW if the requested packages weren't produced,
+    # so silent empty releases can't happen again.
+    # ==================================================================
+    - name: Verify target packages were built
+      if: always() && steps.build-info.outputs.skip-building != 'true'
+      run: |
+        set -euo pipefail
+        missing=0
+        requested=""
+        for f in ./built_*_packages.txt; do
+          [ -f "$f" ] && requested+="$(cat "$f")"$'\n'
+        done
+        requested="$(echo -n "$requested" | sort -u)"
+
+        if [ -z "$requested" ]; then
+          echo ">>> No packages requested this run"
+          exit 0
+        fi
+
+        for pkg in $requested; do
+          if ! ls debs/"${pkg}"_*.deb >/dev/null 2>&1; then
+            echo "::error::Package '${pkg}' was requested but no .deb was produced"
+            missing=$((missing + 1))
+          else
+            echo ">>> ${pkg}: built OK"
+          fi
+        done
+
+        if [ "$missing" -gt 0 ]; then
+          echo "::error::${missing} requested package(s) failed to build — not creating a release."
+          exit 1
+        fi
 
     - name: Checksums for built *.deb files
       if: always()
