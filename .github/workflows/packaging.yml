@@ -72,24 +72,14 @@ jobs:
       with:
         fetch-depth: 1000
 
-    # ==================================================================
-    # PATCH 1 — properties.sh: make TERMUX_REPO_* match our custom prefix
-    # so build-package.sh -I is not silently disabled.
-    # ==================================================================
     - name: Patch properties.sh
       run: |
         set -euo pipefail
         PROPS="scripts/properties.sh"
-        if [ ! -f "$PROPS" ]; then
-          echo "::error::scripts/properties.sh not found"
-          exit 1
-        fi
+        [ -f "$PROPS" ] || { echo "::error::$PROPS not found"; exit 1; }
 
         APP_PKG=$(grep -E '^TERMUX_APP__PACKAGE_NAME=' "$PROPS" | head -1 | cut -d'"' -f2)
-        if [ -z "$APP_PKG" ]; then
-          echo "::error::Could not extract TERMUX_APP__PACKAGE_NAME"
-          exit 1
-        fi
+        [ -n "$APP_PKG" ] || { echo "::error::Could not extract TERMUX_APP__PACKAGE_NAME"; exit 1; }
         echo ">>> Detected app package name: $APP_PKG"
 
         DATA_DIR="/data/data/${APP_PKG}"
@@ -109,35 +99,17 @@ jobs:
         echo ">>> Patched TERMUX_REPO_* values:"
         grep -nE '^TERMUX_REPO_APP__|^TERMUX_REPO__' "$PROPS" || true
 
-    # ==================================================================
-    # PATCH 2 — termux_download_deb_pac.sh: force it to always fail,
-    # so build-package.sh falls back to source-building missing deps
-    # instead of pulling them from the official Termux repos (which
-    # have the wrong prefix baked in).
-    #
-    # Deps that ARE already registered in dpkg (.list + status) are
-    # skipped before this function is ever called, so nothing gets
-    # rebuilt unnecessarily.
-    # ==================================================================
     - name: Patch termux_download_deb_pac.sh
       run: |
         set -euo pipefail
         TDP="scripts/build/termux_download_deb_pac.sh"
-        if [ ! -f "$TDP" ]; then
-          echo "::error::$TDP not found"
-          exit 1
-        fi
-
-        # Insert a "return 1" right after the function's opening line.
-        # Also mark the function with a comment for grep-ability.
+        [ -f "$TDP" ] || { echo "::error::$TDP not found"; exit 1; }
         if grep -q 'FORCED-BY-CI-FORCE-SOURCE-BUILD' "$TDP"; then
           echo ">>> Already patched"
         else
           sed -i '/^termux_download_deb_pac() {/a\    # FORCED-BY-CI-FORCE-SOURCE-BUILD: return failure so build-package.sh builds from source\n    return 1' "$TDP"
           echo ">>> Patched $TDP"
         fi
-
-        echo ">>> Verify:"
         grep -n -A2 'termux_download_deb_pac() {' "$TDP" | head -10
 
     - name: Gather build summary
@@ -377,15 +349,9 @@ jobs:
         echo ""
 
         PROPS="/home/builder/termux-packages/scripts/properties.sh"
-        if [ -f "$PROPS" ]; then
-          echo ">>> Confirm properties.sh inside container:"
-          grep -nE '^TERMUX_REPO_APP__PACKAGE_NAME=|^TERMUX_APP__PACKAGE_NAME=' "$PROPS" || true
-        fi
+        [ -f "$PROPS" ] && { echo ">>> Confirm properties.sh:"; grep -nE '^TERMUX_REPO_APP__PACKAGE_NAME=|^TERMUX_APP__PACKAGE_NAME=' "$PROPS" || true; }
         TDP="/home/builder/termux-packages/scripts/build/termux_download_deb_pac.sh"
-        if [ -f "$TDP" ]; then
-          echo ">>> Confirm termux_download_deb_pac.sh is patched:"
-          grep -n 'FORCED-BY-CI-FORCE-SOURCE-BUILD' "$TDP" || echo "  (patch not present)"
-        fi
+        [ -f "$TDP" ] && { echo ">>> Confirm termux_download_deb_pac.sh is patched:"; grep -c 'FORCED-BY-CI-FORCE-SOURCE-BUILD' "$TDP"; }
         echo ""
 
         export DPKG_ADMINDIR="$PREFIX/var/lib/dpkg"
@@ -397,20 +363,51 @@ jobs:
         dpkg --instdir=/ --force-all --configure -a \
           || echo ">>> dpkg --configure -a returned non-zero (continuing)"
 
+        # ======================================================================
+        # CRITICAL FIX — normalize dpkg .list filenames.
+        #
+        # On Ubuntu (host arch amd64), `dpkg --force-all -i` of an aarch64 .deb
+        # creates `var/lib/dpkg/info/<pkg>:aarch64.list`. But build-package.sh
+        # looks for `var/lib/dpkg/info/<pkg>.list` (no arch suffix). Because
+        # of the mismatch, every dep is treated as "not installed" and rebuilt
+        # from source.
+        #
+        # We symlink each `<pkg>:aarch64.list` to `<pkg>.list` so BOTH names
+        # resolve to the same content.
+        # ======================================================================
         echo ""
-        echo ">>> dpkg-query sample:"
-        for c in libexpat openssl ncurses readline libandroid-support zlib libllvm llvm; do
+        echo ">>> Normalizing .list filenames (add symlinks for <pkg>.list)"
+        cd "$PREFIX/var/lib/dpkg/info"
+        created=0
+        shopt -s nullglob
+        for f in *:aarch64.list; do
+          base="${f%:aarch64.list}"
+          if [ ! -e "${base}.list" ]; then
+            ln -s "$f" "${base}.list"
+            created=$((created + 1))
+          fi
+        done
+        shopt -u nullglob
+        echo "    created ${created} symlink(s)"
+        echo "    total .list entries now: $(ls -1 *.list 2>/dev/null | wc -l)"
+        echo ""
+
+        echo ">>> Sample — attr entry:"
+        ls -la attr*.list 2>/dev/null || echo "    (no attr .list files!)"
+        echo ""
+
+        echo ">>> Sanity — dpkg-query sample:"
+        for c in libexpat openssl ncurses readline libandroid-support zlib attr llvm libllvm; do
           st=$(dpkg-query -W --showformat='${Status}' "$c" 2>/dev/null || true)
-          printf '  %-25s -> %s\n' "$c" "${st:-NOT FOUND}"
+          haslist=""
+          [ -f "$PREFIX/var/lib/dpkg/info/${c}.list" ] && haslist="(list OK)"
+          printf '  %-25s -> %-30s %s\n' "$c" "${st:-NOT FOUND}" "$haslist"
         done
 
         echo ""
         echo ">>> Building: __PKGS_PLACEHOLDER__"
         echo ""
 
-        # -I is honored now (properties patched). Deps already in dpkg
-        # are skipped via .list check. Deps NOT in dpkg: the patched
-        # termux_download_deb_pac forces a source build for them.
         ./build-package.sh -I -C -a aarch64 __PKGS_PLACEHOLDER__
         INNER_EOF
 
@@ -442,10 +439,6 @@ jobs:
         echo ">>> debs/ contains: $(find debs -type f -name '*.deb' | wc -l) .deb files"
         tar cf artifacts/debs-${{ matrix.target_arch }}-${{ github.sha }}.tar debs
 
-    # ==================================================================
-    # FAIL THE WORKFLOW if the requested packages weren't produced,
-    # so silent empty releases can't happen again.
-    # ==================================================================
     - name: Verify target packages were built
       if: always() && steps.build-info.outputs.skip-building != 'true'
       run: |
@@ -456,25 +449,16 @@ jobs:
           [ -f "$f" ] && requested+="$(cat "$f")"$'\n'
         done
         requested="$(echo -n "$requested" | sort -u)"
-
-        if [ -z "$requested" ]; then
-          echo ">>> No packages requested this run"
-          exit 0
-        fi
-
+        [ -z "$requested" ] && { echo ">>> No packages requested"; exit 0; }
         for pkg in $requested; do
-          if ! ls debs/"${pkg}"_*.deb >/dev/null 2>&1; then
+          if ls debs/"${pkg}"_*.deb >/dev/null 2>&1; then
+            echo ">>> ${pkg}: built OK"
+          else
             echo "::error::Package '${pkg}' was requested but no .deb was produced"
             missing=$((missing + 1))
-          else
-            echo ">>> ${pkg}: built OK"
           fi
         done
-
-        if [ "$missing" -gt 0 ]; then
-          echo "::error::${missing} requested package(s) failed to build — not creating a release."
-          exit 1
-        fi
+        [ "$missing" -gt 0 ] && { echo "::error::${missing} requested package(s) failed"; exit 1; }
 
     - name: Checksums for built *.deb files
       if: always()
