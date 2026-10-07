@@ -90,6 +90,7 @@ jobs:
           -e "s|^TERMUX_REPO__HOME=.*|TERMUX_REPO__HOME=\"${ROOTFS}/home\"|" \
           -e "s|^TERMUX_REPO__PREFIX=.*|TERMUX_REPO__PREFIX=\"${PREFIX}\"|" \
           "$PROPS"
+        echo ">>> Patched:"
         grep -nE '^TERMUX_REPO_APP__|^TERMUX_REPO__' "$PROPS" || true
 
     - name: Patch termux_download_deb_pac.sh
@@ -97,32 +98,49 @@ jobs:
         set -euo pipefail
         TDP="scripts/build/termux_download_deb_pac.sh"
         [ -f "$TDP" ] || { echo "::error::$TDP not found"; exit 1; }
-        if grep -q 'FORCED-BY-CI-FORCE-SOURCE-BUILD' "$TDP"; then
-          echo ">>> Already patched"
-        else
+        if ! grep -q 'FORCED-BY-CI-FORCE-SOURCE-BUILD' "$TDP"; then
           sed -i '/^termux_download_deb_pac() {/a\    # FORCED-BY-CI-FORCE-SOURCE-BUILD: return failure\n    return 1' "$TDP"
         fi
-        grep -n -A2 'termux_download_deb_pac() {' "$TDP" | head -10
+        echo ">>> patched termux_download_deb_pac.sh"
 
-    - name: Patch termux_step_get_dependencies.sh (enables SKIP_DEP_CHECK)
+    # =====================================================================
+    # Patch BOTH dependency entry points so SKIP_DEP_CHECK works regardless
+    # of which function build-package.sh calls in your fork's version.
+    # =====================================================================
+    - name: Patch dependency resolver files
       run: |
         set -euo pipefail
-        DEP_SH=""
-        for f in scripts/build/termux_step_get_dependencies.sh \
-                 scripts/build/termux_step_get_dependencies_package.sh \
-                 scripts/build/termux_step_get_dependencies_repo.sh
-        do
-          [ -f "$f" ] && grep -q 'termux_step_get_dependencies() {' "$f" && { DEP_SH="$f"; break; }
-        done
-        [ -z "$DEP_SH" ] && DEP_SH="$(grep -rln 'termux_step_get_dependencies() {' scripts/build/ 2>/dev/null | head -1 || true)"
-        if [ -z "$DEP_SH" ]; then
-          echo "::warning::Could not find termux_step_get_dependencies()"; exit 0
+        patched=0
+        # Find every script that defines termux_step_get_dependencies or
+        # termux_step_get_dependencies_package and inject the early return.
+        while read -r f; do
+          [ -z "$f" ] && continue
+          echo ">>> inspecting $f"
+          for fn in termux_step_get_dependencies termux_step_get_dependencies_package; do
+            if grep -q "^${fn}() {" "$f"; then
+              if grep -q "SKIP-DEP-CHECK-PATCH" "$f"; then
+                echo "    ${fn}() already patched"
+              else
+                sed -i "/^${fn}() {/a\\
+    # SKIP-DEP-CHECK-PATCH\\
+    if [ \"\${SKIP_DEP_CHECK:-}\" = \"true\" ]; then\\
+        echo \">>> SKIP_DEP_CHECK=true — skipping ${fn}\"\\
+        return 0\\
+    fi" "$f"
+                echo "    patched ${fn}()"
+                patched=$((patched + 1))
+              fi
+            fi
+          done
+        done < <(grep -rln 'termux_step_get_dependencies' scripts/build/ 2>/dev/null || true)
+
+        if [ "$patched" -eq 0 ]; then
+          echo "::warning::No dependency functions were patched — SKIP_DEP_CHECK may not work"
         fi
-        echo ">>> Patching $DEP_SH"
-        if ! grep -q 'SKIP-DEP-CHECK-PATCH' "$DEP_SH"; then
-          sed -i '/^termux_step_get_dependencies() {/a\    # SKIP-DEP-CHECK-PATCH\n    if [ "${SKIP_DEP_CHECK:-}" = "true" ]; then\n        echo ">>> SKIP_DEP_CHECK=true — skipping dependency resolution"\n        return 0\n    fi' "$DEP_SH"
-        fi
-        grep -n -A6 'termux_step_get_dependencies() {' "$DEP_SH" | head -12
+
+        echo ""
+        echo ">>> Verify all patched functions:"
+        grep -rln 'SKIP-DEP-CHECK-PATCH' scripts/build/ 2>/dev/null || echo "    (none)"
 
     - name: Gather build summary
       id: build-info
@@ -283,15 +301,6 @@ jobs:
       if: ${{ steps.build-info.outputs.free-space == 'true' && steps.build-info.outputs.skip-building != 'true' }}
       run: ./scripts/free-space.sh
 
-    # =====================================================================
-    # DYNAMIC release discovery — replaces the hardcoded RELEASES array.
-    #
-    # Fetches every release from this repo (page 1, up to 100), excludes
-    # "packages", reverses the list so OLDEST is processed first, then
-    # downloads each with `mv -f`. Result: newest same-named .deb wins.
-    #
-    # No maintenance required as new date-tagged releases are created.
-    # =====================================================================
     - name: Download pre-built dependencies
       if: ${{ steps.build-info.outputs.skip-building != 'true' }}
       env:
@@ -299,53 +308,27 @@ jobs:
       run: |
         set -euo pipefail
         mkdir -p debs-deps
-
-        echo ">>> Discovering releases (excluding 'packages')..."
-        # `?per_page=10` gets up to 100 releases on a single page — enough
-        # for many months of nightly builds. `tac` reverses so oldest runs
-        # first and `mv -f` lets newer files overwrite older ones.
+        echo ">>> Discovering releases..."
         mapfile -t TAGS < <(
-          gh api "repos/${{ github.repository }}/releases?per_page=10" \
-            --jq '.[] | select(.tag_name != "packages") | .tag_name' \
-            | tac
+          gh api "repos/${{ github.repository }}/releases?per_page=100" \
+            --jq '.[] | select(.tag_name != "packages") | .tag_name' | tac
         )
-
-        if [ "${#TAGS[@]}" -eq 0 ]; then
-          echo "::warning::No releases found to pull deps from."
-          exit 0
-        fi
-
-        echo ">>> ${#TAGS[@]} release(s) to scan (oldest first):"
+        [ "${#TAGS[@]}" -eq 0 ] && { echo "::warning::No releases"; exit 0; }
+        echo ">>> ${#TAGS[@]} release(s) — oldest first:"
         printf '    %s\n' "${TAGS[@]}"
-        echo ""
-
-        downloaded=0
         for tag in "${TAGS[@]}"; do
           tmpdir="$(mktemp -d)"
-          if gh release download "$tag" -p "*.deb" -D "$tmpdir" \
-                --repo "${{ github.repository }}" 2>/dev/null; then
-            shopt -s nullglob
-            files=("$tmpdir"/*.deb)
-            shopt -u nullglob
-            echo ">>> $tag: got ${#files[@]} .deb"
+          if gh release download "$tag" -p "*.deb" -D "$tmpdir" --repo "${{ github.repository }}" 2>/dev/null; then
+            shopt -s nullglob; files=("$tmpdir"/*.deb); shopt -u nullglob
+            echo ">>> $tag: ${#files[@]} .deb"
             for f in "${files[@]}"; do mv -f "$f" debs-deps/; done
-            downloaded=$((downloaded + ${#files[@]}))
-          else
-            echo ">>> $tag: no .deb assets"
           fi
           rm -rf "$tmpdir"
         done
-
-        echo ""
-        echo ">>> Total .deb files moved into debs-deps: ${downloaded}"
-        echo ">>> Unique filenames in debs-deps: $(find debs-deps -maxdepth 1 -name '*.deb' -printf '%f\n' | sort -u | wc -l)"
-        echo ">>> Sample:"
-        find debs-deps -maxdepth 1 -name '*.deb' -printf '    %f\n' | sort | head -15
+        echo ">>> debs-deps: $(find debs-deps -maxdepth 1 -name '*.deb' | wc -l) unique file(s)"
 
     - name: Build packages
       if: ${{ steps.build-info.outputs.skip-building != 'true' }}
-      env:
-        SKIP_DEP_CHECK_INPUT: ${{ github.event.inputs.skip-dep-check || 'false' }}
       run: |
         declare -a packages=()
         for repo_path in $(jq --raw-output 'del(.pkg_format) | keys | .[]' repo.json); do
@@ -356,11 +339,19 @@ jobs:
         done
         PKGS_STR="${packages[*]}"
         echo "packages: ${PKGS_STR}"
-        echo "SKIP_DEP_CHECK_INPUT=${SKIP_DEP_CHECK_INPUT}"
+
+        # Bake SKIP_DEP_CHECK value into the inner script. We can't pass it
+        # as a real env var to the container through run-docker.sh, and
+        # `-e VAR=...` is interpreted as a bash positional arg, not env.
+        SKIP_DEP_CHECK_BAKED="${{ github.event.inputs.skip-dep-check || 'false' }}"
+        echo "SKIP_DEP_CHECK_BAKED=${SKIP_DEP_CHECK_BAKED}"
 
         if [[ "${#packages[@]}" -gt 0 ]]; then
           cat > /tmp/inner-build.sh <<'INNER_EOF'
         set -e
+
+        # ---- baked values, expanded by the host shell ----
+        export SKIP_DEP_CHECK="__SKIP_DEP_CHECK__"
 
         PREFIX=/data/data/app.xodos2/files/usr
         BUILD_ROOT=/home/builder/termux-packages
@@ -373,6 +364,7 @@ jobs:
         done
         [ -z "$DEBS_DIR" ] && { echo ">>> debs-deps not found"; exit 1; }
         echo ">>> Found debs-deps at: $DEBS_DIR"
+        echo ">>> SKIP_DEP_CHECK=$SKIP_DEP_CHECK"
 
         export DPKG_ADMINDIR="$PREFIX/var/lib/dpkg"
 
@@ -398,28 +390,40 @@ jobs:
         done
         echo "    prefilled ${prefilled} .list file(s)"
 
-        if [ "${SKIP_DEP_CHECK}" = "true" ]; then
+        echo ""
+        echo ">>> Dep resolution test (what build-package.sh will do):"
+        for c in libass libudfread libplacebo libbluray libbs2b; do
+          st=$(dpkg-query -W --showformat='${Status}' "$c" 2>/dev/null || true)
+          has="no"
+          [ -f "$PREFIX/var/lib/dpkg/info/${c}.list" ] && has="yes"
+          printf '  %-25s status=%-30s .list=%s\n' "$c" "${st:-NOT FOUND}" "$has"
+        done
+
+        if [ "$SKIP_DEP_CHECK" = "true" ]; then
           echo ""
           echo "###################################################################"
-          echo "#  SKIP_DEP_CHECK=true                                             "
-          echo "#  build-package.sh will NOT resolve or build dependencies.        "
+          echo "#  SKIP_DEP_CHECK=true — dependency walk will be bypassed          "
           echo "###################################################################"
         fi
 
         echo ""
         echo ">>> Building: __PKGS_PLACEHOLDER__"
         cd "$BUILD_ROOT"
+
+        # -C only. No -I. Dep resolution happens inside build-package.sh
+        # (controlled by SKIP_DEP_CHECK env we exported above).
         ./build-package.sh -C -a aarch64 __PKGS_PLACEHOLDER__
         INNER_EOF
 
           sed -i "s|__PKGS_PLACEHOLDER__|${PKGS_STR}|g" /tmp/inner-build.sh
+          sed -i "s|__SKIP_DEP_CHECK__|${SKIP_DEP_CHECK_BAKED}|g" /tmp/inner-build.sh
+
           echo ">>> inner-build.sh content:"
           cat /tmp/inner-build.sh
           echo ">>> ---"
 
           ENCODED=$(base64 -w0 /tmp/inner-build.sh)
           ./scripts/run-docker.sh -d bash -c "echo '${ENCODED}' | base64 -d | bash" \
-            -e SKIP_DEP_CHECK="${SKIP_DEP_CHECK_INPUT}" \
             || echo "::warning::Some packages failed to build — continuing"
         fi
 
