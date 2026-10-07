@@ -287,10 +287,6 @@ jobs:
         RELEASES=(
           "2026.10.03-230607"
           "2026.10.06-123109"
-          "2026.10.06-161453"
-          "2026.10.03-213828"
-          "2026.10.03-223715"
-          "2026.10.06-161453"
         )
         for tag in "${RELEASES[@]}"; do
           echo ">>> Downloading .deb files from release $tag"
@@ -366,52 +362,36 @@ jobs:
         dpkg --instdir=/ --force-all --configure -a \
           || echo ">>> dpkg --configure -a returned non-zero (continuing)"
 
-        # ===============================================================
-        # Normalize .list filenames — wrapped in a subshell so the cd
-        # does not leak out and break the subsequent build-package.sh call.
-        # ===============================================================
-        echo ""
-        echo ">>> Normalizing .list filenames (add symlinks for <pkg>.list)"
+        # Normalize any <pkg>:aarch64.list → <pkg>.list (subshell so cd doesn't leak)
         (
-          cd "$PREFIX/var/lib/dpkg/info" || exit 0
-          created=0
+          cd "$PREFIX/var/lib/dpkg/info" 2>/dev/null || exit 0
           shopt -s nullglob
           for f in *:aarch64.list; do
             base="${f%:aarch64.list}"
-            if [ ! -e "${base}.list" ]; then
-              ln -s "$f" "${base}.list"
-              created=$((created + 1))
-            fi
+            [ -e "${base}.list" ] || ln -s "$f" "${base}.list"
           done
-          shopt -u nullglob
-          echo "    created ${created} symlink(s)"
-          echo "    total .list entries now: $(ls -1 *.list 2>/dev/null | wc -l)"
         )
 
         echo ""
-        echo ">>> Sample — attr entry:"
-        ls -la "$PREFIX/var/lib/dpkg/info/"attr*.list 2>/dev/null || echo "    (no attr .list files!)"
-        echo ""
-
-        echo ">>> Sanity — dpkg-query sample:"
+        echo ">>> dpkg-query sanity:"
         for c in libexpat openssl ncurses readline libandroid-support zlib attr llvm libllvm; do
           st=$(dpkg-query -W --showformat='${Status}' "$c" 2>/dev/null || true)
-          haslist=""
-          [ -f "$PREFIX/var/lib/dpkg/info/${c}.list" ] && haslist="(list OK)"
-          printf '  %-25s -> %-30s %s\n' "$c" "${st:-NOT FOUND}" "$haslist"
+          printf '  %-25s -> %s\n' "$c" "${st:-NOT FOUND}"
         done
 
         echo ""
-        echo ">>> Building: __PKGS_PLACEHOLDER__"
+        echo ">>> Building (NO -I, so no dependency resolution is attempted): __PKGS_PLACEHOLDER__"
         echo ""
 
-        # Belt-and-braces: make sure we are in the right place to invoke
-        # build-package.sh.
         cd "$BUILD_ROOT"
-        pwd
-        ls -la build-package.sh
 
-        ./build-package.sh -I -C -a aarch64 __PKGS_PLACEHOLDER__
+        # NOTE: -I is intentionally removed.
+        # With -I, build-package.sh tries to download every dep from the
+        # Termux repos; our repo-name mismatch causes the download to fail
+        # and build-package.sh falls back to building every dep from source.
+        # Without -I, build-package.sh assumes deps are already present
+        # (which they are, via the dpkg -i above) and just compiles the target.
+        ./build-package.sh -C -a aarch64 __PKGS_PLACEHOLDER__
         INNER_EOF
 
           sed -i "s|__PKGS_PLACEHOLDER__|${PKGS_STR}|g" /tmp/inner-build.sh
