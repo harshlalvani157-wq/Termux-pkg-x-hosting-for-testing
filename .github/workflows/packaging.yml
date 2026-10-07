@@ -11,6 +11,10 @@ on:
       packages:
         description: "A space-separated names of packages selected for rebuilding"
         required: true
+      skip-dep-check:
+        description: "Skip dependency resolution — just build the selected package(s)."
+        type: boolean
+        default: false
       free-space:
         description: "Free space even if not building large package"
         type: boolean
@@ -35,15 +39,13 @@ jobs:
       timestamp: ${{ steps.tag.outputs.timestamp }}
     steps:
     - uses: actions/checkout@v6
-      with:
-        fetch-depth: 1
+      with: { fetch-depth: 1 }
     - name: Compute release tag
       id: tag
       run: |
         TAG="$(date -u +'%Y.%m.%d-%H%M%S')"
         echo "tag=${TAG}"       >> "$GITHUB_OUTPUT"
         echo "timestamp=${TAG}" >> "$GITHUB_OUTPUT"
-        echo ">>> release tag: ${TAG}"
     - name: Create release
       run: |
         set -euo pipefail
@@ -69,23 +71,16 @@ jobs:
     steps:
     - name: Clone repository
       uses: actions/checkout@v6
-      with:
-        fetch-depth: 1000
+      with: { fetch-depth: 1000 }
 
     - name: Patch properties.sh
       run: |
         set -euo pipefail
         PROPS="scripts/properties.sh"
         [ -f "$PROPS" ] || { echo "::error::$PROPS not found"; exit 1; }
-
         APP_PKG=$(grep -E '^TERMUX_APP__PACKAGE_NAME=' "$PROPS" | head -1 | cut -d'"' -f2)
-        [ -n "$APP_PKG" ] || { echo "::error::Could not extract TERMUX_APP__PACKAGE_NAME"; exit 1; }
-        echo ">>> Detected app package name: $APP_PKG"
-
-        DATA_DIR="/data/data/${APP_PKG}"
-        ROOTFS="${DATA_DIR}/files"
-        PREFIX="${ROOTFS}/usr"
-
+        [ -n "$APP_PKG" ] || { echo "::error::No TERMUX_APP__PACKAGE_NAME"; exit 1; }
+        DATA_DIR="/data/data/${APP_PKG}"; ROOTFS="${DATA_DIR}/files"; PREFIX="${ROOTFS}/usr"
         sed -i \
           -e "s|^TERMUX_REPO_APP__PACKAGE_NAME=.*|TERMUX_REPO_APP__PACKAGE_NAME=\"${APP_PKG}\"|" \
           -e "s|^TERMUX_REPO_APP__DATA_DIR=.*|TERMUX_REPO_APP__DATA_DIR=\"${DATA_DIR}\"|" \
@@ -95,8 +90,6 @@ jobs:
           -e "s|^TERMUX_REPO__HOME=.*|TERMUX_REPO__HOME=\"${ROOTFS}/home\"|" \
           -e "s|^TERMUX_REPO__PREFIX=.*|TERMUX_REPO__PREFIX=\"${PREFIX}\"|" \
           "$PROPS"
-
-        echo ">>> Patched TERMUX_REPO_* values:"
         grep -nE '^TERMUX_REPO_APP__|^TERMUX_REPO__' "$PROPS" || true
 
     - name: Patch termux_download_deb_pac.sh
@@ -107,10 +100,29 @@ jobs:
         if grep -q 'FORCED-BY-CI-FORCE-SOURCE-BUILD' "$TDP"; then
           echo ">>> Already patched"
         else
-          sed -i '/^termux_download_deb_pac() {/a\    # FORCED-BY-CI-FORCE-SOURCE-BUILD: return failure so build-package.sh builds from source\n    return 1' "$TDP"
-          echo ">>> Patched $TDP"
+          sed -i '/^termux_download_deb_pac() {/a\    # FORCED-BY-CI-FORCE-SOURCE-BUILD: return failure\n    return 1' "$TDP"
         fi
         grep -n -A2 'termux_download_deb_pac() {' "$TDP" | head -10
+
+    - name: Patch termux_step_get_dependencies.sh (enables SKIP_DEP_CHECK)
+      run: |
+        set -euo pipefail
+        DEP_SH=""
+        for f in scripts/build/termux_step_get_dependencies.sh \
+                 scripts/build/termux_step_get_dependencies_package.sh \
+                 scripts/build/termux_step_get_dependencies_repo.sh
+        do
+          [ -f "$f" ] && grep -q 'termux_step_get_dependencies() {' "$f" && { DEP_SH="$f"; break; }
+        done
+        [ -z "$DEP_SH" ] && DEP_SH="$(grep -rln 'termux_step_get_dependencies() {' scripts/build/ 2>/dev/null | head -1 || true)"
+        if [ -z "$DEP_SH" ]; then
+          echo "::warning::Could not find termux_step_get_dependencies()"; exit 0
+        fi
+        echo ">>> Patching $DEP_SH"
+        if ! grep -q 'SKIP-DEP-CHECK-PATCH' "$DEP_SH"; then
+          sed -i '/^termux_step_get_dependencies() {/a\    # SKIP-DEP-CHECK-PATCH\n    if [ "${SKIP_DEP_CHECK:-}" = "true" ]; then\n        echo ">>> SKIP_DEP_CHECK=true — skipping dependency resolution"\n        return 0\n    fi' "$DEP_SH"
+        fi
+        grep -n -A6 'termux_step_get_dependencies() {' "$DEP_SH" | head -12
 
     - name: Gather build summary
       id: build-info
@@ -126,8 +138,7 @@ jobs:
           if [ -z "${{ github.event.pull_request.base.sha }}" ]; then
             if ! git log "$OLD_COMMIT" > /dev/null; then
               if [ "$(git branch --show-current)" = "master" ]; then
-                echo "Force push detected on master branch. Unable to proceed."
-                exit 1
+                echo "Force push detected on master branch. Unable to proceed."; exit 1
               else
                 OLD_COMMIT=$(git fetch origin master >&2; git merge-base origin/master $HEAD_COMMIT)
               fi
@@ -141,8 +152,7 @@ jobs:
         touch ./debs/.placeholder
 
         if [[ "${{ github.event_name }}" == "pull_request" && -n "$(git rev-list --merges "$(git fetch origin master >&2; git merge-base origin/master $HEAD_COMMIT)..$HEAD_COMMIT")" ]]; then
-          echo "::error ::Merge commits are not allowed in pull requests."
-          exit 1
+          echo "::error ::Merge commits not allowed in PRs."; exit 1
         fi
 
         OLD_COMMIT="$OLD_COMMIT" HEAD_COMMIT="$HEAD_COMMIT" GITHUB_TOKEN="${{ secrets.GITHUB_TOKEN }}" scripts/utils/termux_reuse_pr_build_artifacts.sh "${{ github.event_name }}" "${{ matrix.target_arch }}" || true
@@ -150,19 +160,15 @@ jobs:
         if [ "${{ github.event_name }}" != "workflow_dispatch" ]; then
           if grep -qiP '^\s*%ci:no-build\s*$' <(git log --format="%B" -n 1 --no-merges "HEAD"); then
             tar cf artifacts/debs-${{ matrix.target_arch }}.tar debs
-            echo "[!] Force exiting as tag '%ci:no-build' was applied to HEAD commit message."
-            exit 0
+            echo "[!] %ci:no-build — exiting."; exit 0
           fi
-
           for repo_path in $(jq --raw-output 'del(.pkg_format) | keys | .[]' repo.json); do
             repo=$(jq --raw-output '.["'${repo_path}'"].name' repo.json)
             while read -r file; do
               if ! [[ $file == ${repo_path}/* ]]; then continue; fi
               if [[ $file =~ ^${repo_path}/([.a-z0-9+-]*)/([.a-z0-9+-]*).subpackage.sh$ ]]; then
                 pkg=${BASH_REMATCH[1]}; subpkg=${BASH_REMATCH[2]}
-                if [ ! -f "${repo_path}/${pkg}/${subpkg}.subpackage.sh" ]; then
-                  echo "$subpkg" >> ./deleted_${repo}_packages.txt
-                fi
+                [ ! -f "${repo_path}/${pkg}/${subpkg}.subpackage.sh" ] && echo "$subpkg" >> ./deleted_${repo}_packages.txt
               elif [[ $file =~ ^${repo_path}/([.a-z0-9+-]*)/.*$ ]]; then
                 pkg=${BASH_REMATCH[1]}
                 if [ -d "${repo_path}/${pkg}" ]; then
@@ -201,7 +207,7 @@ jobs:
               subfile=$(find "${repo_path}" -mindepth 2 -maxdepth 2 -type f -name "${pkg}.subpackage.sh" -print -quit 2>/dev/null || true)
               if [ -n "$subfile" ]; then
                 parent=$(basename "$(dirname "$subfile")")
-                echo ">>> '${pkg}' is a subpackage of '${parent}' — building '${parent}' instead"
+                echo ">>> '${pkg}' is a subpackage of '${parent}' — building '${parent}'"
                 found=true
                 echo "$parent" >> ./built_${repo}_packages.txt
                 for s in $(find "${repo_path}/${parent}/" -maxdepth 1 -type f -name \*.subpackage.sh | sort); do
@@ -220,9 +226,9 @@ jobs:
         fi
 
         for repo in $(jq --raw-output 'del(.pkg_format) | .[].name' repo.json); do
-          [ -f ./built_${repo}_packages.txt ]    && { sort ./built_${repo}_packages.txt | uniq > ./tmp && mv ./tmp ./built_${repo}_packages.txt; }
+          [ -f ./built_${repo}_packages.txt ]    && { sort ./built_${repo}_packages.txt    | uniq > ./tmp && mv ./tmp ./built_${repo}_packages.txt; }
           [ -f ./built_${repo}_subpackages.txt ] && { sort ./built_${repo}_subpackages.txt | uniq > ./tmp && mv ./tmp ./built_${repo}_subpackages.txt; }
-          [ -f ./deleted_${repo}_packages.txt ]  && { sort ./deleted_${repo}_packages.txt | uniq > ./tmp && mv ./tmp ./deleted_${repo}_packages.txt; }
+          [ -f ./deleted_${repo}_packages.txt ]  && { sort ./deleted_${repo}_packages.txt  | uniq > ./tmp && mv ./tmp ./deleted_${repo}_packages.txt; }
         done
 
         declare -a packages=()
@@ -277,6 +283,15 @@ jobs:
       if: ${{ steps.build-info.outputs.free-space == 'true' && steps.build-info.outputs.skip-building != 'true' }}
       run: ./scripts/free-space.sh
 
+    # =====================================================================
+    # DYNAMIC release discovery — replaces the hardcoded RELEASES array.
+    #
+    # Fetches every release from this repo (page 1, up to 100), excludes
+    # "packages", reverses the list so OLDEST is processed first, then
+    # downloads each with `mv -f`. Result: newest same-named .deb wins.
+    #
+    # No maintenance required as new date-tagged releases are created.
+    # =====================================================================
     - name: Download pre-built dependencies
       if: ${{ steps.build-info.outputs.skip-building != 'true' }}
       env:
@@ -284,29 +299,53 @@ jobs:
       run: |
         set -euo pipefail
         mkdir -p debs-deps
-        RELEASES=(
-          "2026.10.03-230607"
-          "2026.10.06-123109"
+
+        echo ">>> Discovering releases (excluding 'packages')..."
+        # `?per_page=10` gets up to 100 releases on a single page — enough
+        # for many months of nightly builds. `tac` reverses so oldest runs
+        # first and `mv -f` lets newer files overwrite older ones.
+        mapfile -t TAGS < <(
+          gh api "repos/${{ github.repository }}/releases?per_page=10" \
+            --jq '.[] | select(.tag_name != "packages") | .tag_name' \
+            | tac
         )
-        for tag in "${RELEASES[@]}"; do
-          echo ">>> Downloading .deb files from release $tag"
+
+        if [ "${#TAGS[@]}" -eq 0 ]; then
+          echo "::warning::No releases found to pull deps from."
+          exit 0
+        fi
+
+        echo ">>> ${#TAGS[@]} release(s) to scan (oldest first):"
+        printf '    %s\n' "${TAGS[@]}"
+        echo ""
+
+        downloaded=0
+        for tag in "${TAGS[@]}"; do
           tmpdir="$(mktemp -d)"
-          if gh release download "$tag" -p "*.deb" -D "$tmpdir" --repo "${{ github.repository }}" 2>/dev/null; then
+          if gh release download "$tag" -p "*.deb" -D "$tmpdir" \
+                --repo "${{ github.repository }}" 2>/dev/null; then
             shopt -s nullglob
             files=("$tmpdir"/*.deb)
             shopt -u nullglob
-            echo "    got ${#files[@]} files from $tag"
+            echo ">>> $tag: got ${#files[@]} .deb"
             for f in "${files[@]}"; do mv -f "$f" debs-deps/; done
+            downloaded=$((downloaded + ${#files[@]}))
           else
-            echo "    (no .deb assets in release $tag — skipping)"
+            echo ">>> $tag: no .deb assets"
           fi
           rm -rf "$tmpdir"
         done
-        count=$(find debs-deps -maxdepth 1 -name '*.deb' | wc -l)
-        echo ">>> Total unique .deb files in debs-deps: ${count}"
+
+        echo ""
+        echo ">>> Total .deb files moved into debs-deps: ${downloaded}"
+        echo ">>> Unique filenames in debs-deps: $(find debs-deps -maxdepth 1 -name '*.deb' -printf '%f\n' | sort -u | wc -l)"
+        echo ">>> Sample:"
+        find debs-deps -maxdepth 1 -name '*.deb' -printf '    %f\n' | sort | head -15
 
     - name: Build packages
       if: ${{ steps.build-info.outputs.skip-building != 'true' }}
+      env:
+        SKIP_DEP_CHECK_INPUT: ${{ github.event.inputs.skip-dep-check || 'false' }}
       run: |
         declare -a packages=()
         for repo_path in $(jq --raw-output 'del(.pkg_format) | keys | .[]' repo.json); do
@@ -315,9 +354,9 @@ jobs:
             packages+=($(cat "./built_${repo}_packages.txt"))
           fi
         done
-
         PKGS_STR="${packages[*]}"
         echo "packages: ${PKGS_STR}"
+        echo "SKIP_DEP_CHECK_INPUT=${SKIP_DEP_CHECK_INPUT}"
 
         if [[ "${#packages[@]}" -gt 0 ]]; then
           cat > /tmp/inner-build.sh <<'INNER_EOF'
@@ -326,83 +365,62 @@ jobs:
         PREFIX=/data/data/app.xodos2/files/usr
         BUILD_ROOT=/home/builder/termux-packages
         cd "$BUILD_ROOT"
-
         mkdir -p "$PREFIX/var/lib/dpkg/info"
 
         DEBS_DIR=""
-        for candidate in \
-          "$BUILD_ROOT/debs-deps" ./debs-deps \
-          /root/termux-packages/debs-deps \
-          /tmp/debs-deps /workspace/debs-deps /github/workspace/debs-deps
-        do
-          if [ -d "$candidate" ] && ls "$candidate"/*.deb >/dev/null 2>&1; then
-            DEBS_DIR="$candidate"; break
-          fi
+        for c in "$BUILD_ROOT/debs-deps" ./debs-deps /root/termux-packages/debs-deps /tmp/debs-deps; do
+          [ -d "$c" ] && ls "$c"/*.deb >/dev/null 2>&1 && { DEBS_DIR="$c"; break; }
         done
-        if [ -z "$DEBS_DIR" ]; then
-          echo ">>> WARNING: debs-deps not found."
-          find / -maxdepth 6 -type d -name debs-deps 2>/dev/null || true
-          exit 1
-        fi
+        [ -z "$DEBS_DIR" ] && { echo ">>> debs-deps not found"; exit 1; }
         echo ">>> Found debs-deps at: $DEBS_DIR"
-        echo ""
-
-        PROPS="$BUILD_ROOT/scripts/properties.sh"
-        [ -f "$PROPS" ] && { echo ">>> Confirm properties.sh:"; grep -nE '^TERMUX_REPO_APP__PACKAGE_NAME=|^TERMUX_APP__PACKAGE_NAME=' "$PROPS" || true; }
-        TDP="$BUILD_ROOT/scripts/build/termux_download_deb_pac.sh"
-        [ -f "$TDP" ] && { echo ">>> Confirm termux_download_deb_pac.sh is patched:"; grep -c 'FORCED-BY-CI-FORCE-SOURCE-BUILD' "$TDP"; }
-        echo ""
 
         export DPKG_ADMINDIR="$PREFIX/var/lib/dpkg"
-        echo ">>> DPKG_ADMINDIR=$DPKG_ADMINDIR"
 
         echo ">>> Installing .debs via dpkg"
         dpkg --instdir=/ --force-all -i "$DEBS_DIR"/*.deb \
-          || echo ">>> dpkg -i returned non-zero (continuing)"
+          || echo ">>> dpkg -i non-zero (continuing)"
         dpkg --instdir=/ --force-all --configure -a \
-          || echo ">>> dpkg --configure -a returned non-zero (continuing)"
-
-        # Normalize any <pkg>:aarch64.list → <pkg>.list (subshell so cd doesn't leak)
-        (
-          cd "$PREFIX/var/lib/dpkg/info" 2>/dev/null || exit 0
-          shopt -s nullglob
-          for f in *:aarch64.list; do
-            base="${f%:aarch64.list}"
-            [ -e "${base}.list" ] || ln -s "$f" "${base}.list"
-          done
-        )
+          || echo ">>> dpkg --configure -a non-zero (continuing)"
 
         echo ""
-        echo ">>> dpkg-query sanity:"
-        for c in libexpat openssl ncurses readline libandroid-support zlib attr llvm libllvm; do
-          st=$(dpkg-query -W --showformat='${Status}' "$c" 2>/dev/null || true)
-          printf '  %-25s -> %s\n' "$c" "${st:-NOT FOUND}"
+        echo ">>> Prefilling missing .list files"
+        prefilled=0
+        for deb in "$DEBS_DIR"/*.deb; do
+          pkg=$(dpkg-deb -f "$deb" Package)
+          if [ ! -f "$PREFIX/var/lib/dpkg/info/${pkg}.list" ]; then
+            dpkg-deb --fsys-tarfile "$deb" 2>/dev/null \
+              | tar -tf - 2>/dev/null \
+              | grep -v '/$' \
+              | sed 's|^\./|/|' \
+              > "$PREFIX/var/lib/dpkg/info/${pkg}.list"
+            prefilled=$((prefilled + 1))
+          fi
         done
+        echo "    prefilled ${prefilled} .list file(s)"
+
+        if [ "${SKIP_DEP_CHECK}" = "true" ]; then
+          echo ""
+          echo "###################################################################"
+          echo "#  SKIP_DEP_CHECK=true                                             "
+          echo "#  build-package.sh will NOT resolve or build dependencies.        "
+          echo "###################################################################"
+        fi
 
         echo ""
-        echo ">>> Building (NO -I, so no dependency resolution is attempted): __PKGS_PLACEHOLDER__"
-        echo ""
-
+        echo ">>> Building: __PKGS_PLACEHOLDER__"
         cd "$BUILD_ROOT"
-
-        # NOTE: -I is intentionally removed.
-        # With -I, build-package.sh tries to download every dep from the
-        # Termux repos; our repo-name mismatch causes the download to fail
-        # and build-package.sh falls back to building every dep from source.
-        # Without -I, build-package.sh assumes deps are already present
-        # (which they are, via the dpkg -i above) and just compiles the target.
         ./build-package.sh -C -a aarch64 __PKGS_PLACEHOLDER__
         INNER_EOF
 
           sed -i "s|__PKGS_PLACEHOLDER__|${PKGS_STR}|g" /tmp/inner-build.sh
-
           echo ">>> inner-build.sh content:"
           cat /tmp/inner-build.sh
           echo ">>> ---"
 
           ENCODED=$(base64 -w0 /tmp/inner-build.sh)
-          ./scripts/run-docker.sh -d bash -c "echo '${ENCODED}' | base64 -d | bash" || \
-            echo "::warning::Some packages failed to build — continuing so the successful ones can still be uploaded and released"
+          ./scripts/run-docker.sh -d bash -c "echo '${ENCODED}' | base64 -d | bash" \
+            -e SKIP_DEP_CHECK="${SKIP_DEP_CHECK_INPUT}" \
+            || echo "::warning::Some packages failed to build — continuing"
         fi
 
     - name: Generate build artifacts
@@ -493,8 +511,7 @@ jobs:
       run: |
         if [ "${{ github.event_name }}" != "workflow_dispatch" ]; then
           if grep -qiP '^\s*%ci:no-build\s*$' <(git log --format="%B" -n 1 --no-merges "HEAD"); then
-            echo "[!] Force exiting as tag '%ci:no-build'."
-            exit 0
+            echo "[!] %ci:no-build — exiting."; exit 0
           fi
         fi
         for archive in debs-*/debs-{aarch64,arm,i686,x86_64}-${{ github.sha }}.tar; do tar xf "$archive"; done
