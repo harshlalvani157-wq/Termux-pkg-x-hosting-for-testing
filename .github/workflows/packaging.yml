@@ -328,12 +328,14 @@ jobs:
         set -e
 
         PREFIX=/data/data/app.xodos2/files/usr
+        BUILD_ROOT=/home/builder/termux-packages
+        cd "$BUILD_ROOT"
+
         mkdir -p "$PREFIX/var/lib/dpkg/info"
 
         DEBS_DIR=""
         for candidate in \
-          "$PWD/debs-deps" ./debs-deps \
-          /home/builder/termux-packages/debs-deps \
+          "$BUILD_ROOT/debs-deps" ./debs-deps \
           /root/termux-packages/debs-deps \
           /tmp/debs-deps /workspace/debs-deps /github/workspace/debs-deps
         do
@@ -349,9 +351,9 @@ jobs:
         echo ">>> Found debs-deps at: $DEBS_DIR"
         echo ""
 
-        PROPS="/home/builder/termux-packages/scripts/properties.sh"
+        PROPS="$BUILD_ROOT/scripts/properties.sh"
         [ -f "$PROPS" ] && { echo ">>> Confirm properties.sh:"; grep -nE '^TERMUX_REPO_APP__PACKAGE_NAME=|^TERMUX_APP__PACKAGE_NAME=' "$PROPS" || true; }
-        TDP="/home/builder/termux-packages/scripts/build/termux_download_deb_pac.sh"
+        TDP="$BUILD_ROOT/scripts/build/termux_download_deb_pac.sh"
         [ -f "$TDP" ] && { echo ">>> Confirm termux_download_deb_pac.sh is patched:"; grep -c 'FORCED-BY-CI-FORCE-SOURCE-BUILD' "$TDP"; }
         echo ""
 
@@ -364,37 +366,31 @@ jobs:
         dpkg --instdir=/ --force-all --configure -a \
           || echo ">>> dpkg --configure -a returned non-zero (continuing)"
 
-        # ======================================================================
-        # CRITICAL FIX — normalize dpkg .list filenames.
-        #
-        # On Ubuntu (host arch amd64), `dpkg --force-all -i` of an aarch64 .deb
-        # creates `var/lib/dpkg/info/<pkg>:aarch64.list`. But build-package.sh
-        # looks for `var/lib/dpkg/info/<pkg>.list` (no arch suffix). Because
-        # of the mismatch, every dep is treated as "not installed" and rebuilt
-        # from source.
-        #
-        # We symlink each `<pkg>:aarch64.list` to `<pkg>.list` so BOTH names
-        # resolve to the same content.
-        # ======================================================================
+        # ===============================================================
+        # Normalize .list filenames — wrapped in a subshell so the cd
+        # does not leak out and break the subsequent build-package.sh call.
+        # ===============================================================
         echo ""
         echo ">>> Normalizing .list filenames (add symlinks for <pkg>.list)"
-        cd "$PREFIX/var/lib/dpkg/info"
-        created=0
-        shopt -s nullglob
-        for f in *:aarch64.list; do
-          base="${f%:aarch64.list}"
-          if [ ! -e "${base}.list" ]; then
-            ln -s "$f" "${base}.list"
-            created=$((created + 1))
-          fi
-        done
-        shopt -u nullglob
-        echo "    created ${created} symlink(s)"
-        echo "    total .list entries now: $(ls -1 *.list 2>/dev/null | wc -l)"
-        echo ""
+        (
+          cd "$PREFIX/var/lib/dpkg/info" || exit 0
+          created=0
+          shopt -s nullglob
+          for f in *:aarch64.list; do
+            base="${f%:aarch64.list}"
+            if [ ! -e "${base}.list" ]; then
+              ln -s "$f" "${base}.list"
+              created=$((created + 1))
+            fi
+          done
+          shopt -u nullglob
+          echo "    created ${created} symlink(s)"
+          echo "    total .list entries now: $(ls -1 *.list 2>/dev/null | wc -l)"
+        )
 
+        echo ""
         echo ">>> Sample — attr entry:"
-        ls -la attr*.list 2>/dev/null || echo "    (no attr .list files!)"
+        ls -la "$PREFIX/var/lib/dpkg/info/"attr*.list 2>/dev/null || echo "    (no attr .list files!)"
         echo ""
 
         echo ">>> Sanity — dpkg-query sample:"
@@ -408,6 +404,12 @@ jobs:
         echo ""
         echo ">>> Building: __PKGS_PLACEHOLDER__"
         echo ""
+
+        # Belt-and-braces: make sure we are in the right place to invoke
+        # build-package.sh.
+        cd "$BUILD_ROOT"
+        pwd
+        ls -la build-package.sh
 
         ./build-package.sh -I -C -a aarch64 __PKGS_PLACEHOLDER__
         INNER_EOF
