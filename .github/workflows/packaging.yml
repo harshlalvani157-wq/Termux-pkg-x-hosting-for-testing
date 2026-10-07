@@ -99,20 +99,27 @@ jobs:
         TDP="scripts/build/termux_download_deb_pac.sh"
         [ -f "$TDP" ] || { echo "::error::$TDP not found"; exit 1; }
         if ! grep -q 'FORCED-BY-CI-FORCE-SOURCE-BUILD' "$TDP"; then
-          sed -i '/^termux_download_deb_pac() {/a\    # FORCED-BY-CI-FORCE-SOURCE-BUILD: return failure\n    return 1' "$TDP"
+          sed -i '/^termux_download_deb_pac() {/a\    # FORCED-BY-CI-FORCE-SOURCE-BUILD: return failure' "$TDP"
+          sed -i '/FORCED-BY-CI-FORCE-SOURCE-BUILD: return failure/a\    return 1' "$TDP"
         fi
-        echo ">>> patched termux_download_deb_pac.sh"
+        grep -n -A3 'termux_download_deb_pac() {' "$TDP" | head -6
 
-    # =====================================================================
-    # Patch BOTH dependency entry points so SKIP_DEP_CHECK works regardless
-    # of which function build-package.sh calls in your fork's version.
-    # =====================================================================
     - name: Patch dependency resolver files
       run: |
         set -euo pipefail
+
+        # Write the patch body once to a file. sed's `r` command inserts
+        # the file contents after the matched line — no backslash
+        # continuations, no YAML indentation headaches.
+        cat > /tmp/dep_patch_body.txt <<'PATCHEOF'
+            # SKIP-DEP-CHECK-PATCH
+            if [ "${SKIP_DEP_CHECK:-}" = "true" ]; then
+                echo ">>> SKIP_DEP_CHECK=true — skipping dependency resolution"
+                return 0
+            fi
+        PATCHEOF
+
         patched=0
-        # Find every script that defines termux_step_get_dependencies or
-        # termux_step_get_dependencies_package and inject the early return.
         while read -r f; do
           [ -z "$f" ] && continue
           echo ">>> inspecting $f"
@@ -121,12 +128,7 @@ jobs:
               if grep -q "SKIP-DEP-CHECK-PATCH" "$f"; then
                 echo "    ${fn}() already patched"
               else
-                sed -i "/^${fn}() {/a\\
-    # SKIP-DEP-CHECK-PATCH\\
-    if [ \"\${SKIP_DEP_CHECK:-}\" = \"true\" ]; then\\
-        echo \">>> SKIP_DEP_CHECK=true — skipping ${fn}\"\\
-        return 0\\
-    fi" "$f"
+                sed -i "/^${fn}() {/r /tmp/dep_patch_body.txt" "$f"
                 echo "    patched ${fn}()"
                 patched=$((patched + 1))
               fi
@@ -134,12 +136,9 @@ jobs:
           done
         done < <(grep -rln 'termux_step_get_dependencies' scripts/build/ 2>/dev/null || true)
 
-        if [ "$patched" -eq 0 ]; then
-          echo "::warning::No dependency functions were patched — SKIP_DEP_CHECK may not work"
-        fi
-
         echo ""
-        echo ">>> Verify all patched functions:"
+        echo ">>> patched ${patched} function(s)"
+        echo ">>> verify:"
         grep -rln 'SKIP-DEP-CHECK-PATCH' scripts/build/ 2>/dev/null || echo "    (none)"
 
     - name: Gather build summary
@@ -340,9 +339,6 @@ jobs:
         PKGS_STR="${packages[*]}"
         echo "packages: ${PKGS_STR}"
 
-        # Bake SKIP_DEP_CHECK value into the inner script. We can't pass it
-        # as a real env var to the container through run-docker.sh, and
-        # `-e VAR=...` is interpreted as a bash positional arg, not env.
         SKIP_DEP_CHECK_BAKED="${{ github.event.inputs.skip-dep-check || 'false' }}"
         echo "SKIP_DEP_CHECK_BAKED=${SKIP_DEP_CHECK_BAKED}"
 
@@ -350,7 +346,6 @@ jobs:
           cat > /tmp/inner-build.sh <<'INNER_EOF'
         set -e
 
-        # ---- baked values, expanded by the host shell ----
         export SKIP_DEP_CHECK="__SKIP_DEP_CHECK__"
 
         PREFIX=/data/data/app.xodos2/files/usr
@@ -391,7 +386,7 @@ jobs:
         echo "    prefilled ${prefilled} .list file(s)"
 
         echo ""
-        echo ">>> Dep resolution test (what build-package.sh will do):"
+        echo ">>> Dep resolution sanity:"
         for c in libass libudfread libplacebo libbluray libbs2b; do
           st=$(dpkg-query -W --showformat='${Status}' "$c" 2>/dev/null || true)
           has="no"
@@ -409,9 +404,6 @@ jobs:
         echo ""
         echo ">>> Building: __PKGS_PLACEHOLDER__"
         cd "$BUILD_ROOT"
-
-        # -C only. No -I. Dep resolution happens inside build-package.sh
-        # (controlled by SKIP_DEP_CHECK env we exported above).
         ./build-package.sh -C -a aarch64 __PKGS_PLACEHOLDER__
         INNER_EOF
 
