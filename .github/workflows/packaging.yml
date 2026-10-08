@@ -78,8 +78,34 @@ jobs:
       with: { fetch-depth: 1000 }
 
     # =================================================================
-    # OPTION B (SAFE DEFAULT): patch prefix paths + main app name only.
-    # Does NOT touch com.termux.api / com.termux.boot / etc.
+    # Remove duplicate packages that live in root-packages/ AND
+    # packages/, and remove the root-packages entry from repo.json so
+    # nothing else tries to build from there.
+    # =================================================================
+    - name: Drop duplicate root-packages
+      run: |
+        set -euo pipefail
+
+        # Known duplicates across packages/ and root-packages/
+        for p in v4l-utils; do
+          if [ -d "root-packages/$p" ]; then
+            echo ">>> removing root-packages/$p (duplicate)"
+            rm -rf "root-packages/$p"
+          fi
+        done
+
+        # Also drop the whole root-packages repo from repo.json so nothing
+        # else in the workflow tries to look for root packages.
+        if jq -e 'has("root-packages")' repo.json >/dev/null; then
+          jq 'del(.["root-packages"])' repo.json > repo.json.tmp && mv repo.json.tmp repo.json
+          echo ">>> removed root-packages from repo.json"
+        fi
+
+        echo ">>> remaining repo.json keys:"
+        jq -r 'keys[]' repo.json
+
+    # =================================================================
+    # Patch prefix path + main app name only.
     # =================================================================
     - name: Patch prefix path + main app name
       run: |
@@ -90,7 +116,6 @@ jobs:
           scripts/properties.sh
 
         # 2) Every hardcoded /data/data/com.termux path across the tree.
-        #    Does NOT touch com.termux.api / com.termux.boot / etc.
         find . \
           -path ./.git -prune -false -o \
           -path ./.github -prune -false -o \
@@ -106,12 +131,16 @@ jobs:
           | head -20 || echo "    (none)"
 
     # =================================================================
-    # Override repo URL so termux-tools ships custom sources.list
+    # Override repo URL + repo package name so termux-tools ships the
+    # custom sources.list and build-package.sh stops complaining about
+    # the -i / repo-package mismatch.
     # =================================================================
     - name: Override repository URL
       run: |
         set -euo pipefail
         cat > "$HOME/.termuxrc" <<'EOF'
+        TERMUX_REPO_PACKAGE="app.xodos2"
+
         TERMUX_REPO_URL=(
           https://xodiosx.github.io/Termux-pkg-x
         )
@@ -329,7 +358,7 @@ jobs:
     - name: Generate build artifacts
       if: always()
       run: |
-        test -d termux-packages/output && mv termux-packages/output/* ./output/
+        test -d termux-packages/output && mv termux-packages/output/* ./output/ 2>/dev/null || true
         for repo in $(jq --raw-output 'del(.pkg_format) | .[].name' repo.json); do
           test -f ./built_${repo}_packages.txt && mv ./built_${repo}_packages.txt ./debs/
           test -f ./built_${repo}_subpackages.txt && cat ./built_${repo}_subpackages.txt >> ./debs/built_${repo}_packages.txt && rm ./built_${repo}_subpackages.txt
@@ -344,12 +373,26 @@ jobs:
         tar cf artifacts/debs-${{ matrix.target_arch }}-${{ github.sha }}.tar debs
 
     # =================================================================
-    # Generate APT repo structure into /docs
+    # Generate APT repo structure into /docs — guarded so an empty
+    # debs/ doesn't blow up the whole job.
     # =================================================================
     - name: Generate APT repository
       if: always()
       run: |
-        pip3 install termux-apt-repo
+        set -euo pipefail
+        deb_count=$(find debs -maxdepth 1 -type f -name '*.deb' 2>/dev/null | wc -l)
+        echo ">>> deb_count=${deb_count}"
+
+        if [ "$deb_count" -eq 0 ]; then
+          echo "::warning::No .deb files produced — skipping APT repo generation"
+          mkdir -p docs
+          touch docs/.nojekyll
+          exit 0
+        fi
+
+        pip3 install --user termux-apt-repo
+        export PATH="$HOME/.local/bin:$PATH"
+
         mkdir -p docs
         touch docs/.nojekyll
         termux-apt-repo debs docs stable main
@@ -365,9 +408,13 @@ jobs:
         set -euo pipefail
         git config user.name "github-actions[bot]"
         git config user.email "github-actions[bot]@users.noreply.github.com"
-        git add docs/
-        git commit -m "Update APT repository [skip ci]" || echo "No changes to commit"
-        git push
+        git add docs/ 2>/dev/null || true
+        if git diff --cached --quiet; then
+          echo ">>> no changes to docs/ — skipping commit"
+        else
+          git commit -m "Update APT repository [skip ci]"
+          git push
+        fi
 
     - name: Store *.deb files
       if: always()
