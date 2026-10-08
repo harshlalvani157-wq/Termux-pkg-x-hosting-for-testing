@@ -1,271 +1,299 @@
-name: Generate APT Repository from Release
+name: Build & Release Packages
 
 on:
+  push:
+    branches: [master]
+    paths:
+      - 'packages/**'
+      - 'x11-packages/**'
   workflow_dispatch:
     inputs:
-      release_tag:
-        description: "Release tag to pull .deb files from (e.g. 2026.10.08-183521)"
-        required: true
-        type: string
-      keep_old:
-        description: "Keep valid .deb files already in docs/pool/ from previous runs (corrupt ones are always pruned)"
+      packages:
+        description: "Space-separated package names to build"
+        required: false
+      free-space:
         type: boolean
-        default: true
+        default: false
 
 permissions:
   contents: write
 
 concurrency:
-  group: generate-repo
-  cancel-in-progress: false
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  generate-repo:
+  prepare-release:
+    permissions:
+      contents: write
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-24.04
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
     steps:
-    - name: Checkout repository
+    - uses: actions/checkout@v6
+      with: { fetch-depth: 1 }
+
+    - name: Compute release tag
+      id: tag
+      run: |
+        TAG="$(date -u +'%Y.%m.%d-%H%M%S')"
+        echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+
+    - name: Create release
+      run: |
+        set -euo pipefail
+        TAG="${{ steps.tag.outputs.tag }}"
+        gh release create "$TAG" \
+          --title "Build $TAG" \
+          --notes "Automated package build." \
+          --target "${{ github.sha }}" \
+          || { echo "::error::Failed to create release '$TAG'"; exit 1; }
+
+  build:
+    permissions:
+      contents: write
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        target_arch: [aarch64]
+      fail-fast: false
+    steps:
+    - name: Clone repository
       uses: actions/checkout@v6
-      with:
-        fetch-depth: 1
-        ref: master
+      with: { fetch-depth: 1000 }
 
-    - name: Install tools
-      run: |
-        sudo apt-get update -qq
-        sudo apt-get install -y -qq dpkg-dev apt-utils xz-utils zstd
-
-    # =================================================================
-    # 1. If keep_old=false, wipe the entire pool first.
-    # =================================================================
-    - name: Optionally wipe existing pool
-      if: ${{ inputs.keep_old != 'true' }}
+    - name: Drop duplicate root-packages
       run: |
         set -euo pipefail
-        echo ">>> keep_old=false — wiping docs/pool and docs/dists"
-        rm -rf ./docs/pool ./docs/dists
-
-    # =================================================================
-    # 2. Prune corrupt .deb files already in docs/pool (always runs).
-    #    This kills leftover 404-HTML-saved-as-.deb from old runs.
-    # =================================================================
-    - name: Prune corrupt .deb files in docs/pool
-      run: |
-        set -euo pipefail
-        if [ ! -d ./docs/pool ]; then
-          echo ">>> docs/pool does not exist — nothing to prune"
-          exit 0
-        fi
-
-        removed=0
-        kept=0
-        while IFS= read -r -d '' deb; do
-          if dpkg-deb -I "$deb" >/dev/null 2>&1; then
-            kept=$((kept + 1))
-          else
-            echo ">>> PRUNING corrupt .deb: $deb"
-            rm -f "$deb"
-            removed=$((removed + 1))
+        for p in v4l-utils; do
+          if [ -d "root-packages/$p" ]; then
+            echo ">>> removing root-packages/$p (duplicate)"
+            rm -rf "root-packages/$p"
           fi
-        done < <(find ./docs/pool -type f -name '*.deb' -print0)
-
-        echo ">>> pruned ${removed} corrupt .deb file(s); kept ${kept} valid"
-
-        # Remove now-empty directories
-        find ./docs/pool -mindepth 1 -type d -empty -delete 2>/dev/null || true
-
-    # =================================================================
-    # 3. Download .deb files from the selected release.
-    # =================================================================
-    - name: Download .deb files from release
-      env:
-        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        RELEASE_TAG: ${{ inputs.release_tag }}
-      run: |
-        set -euo pipefail
-        rm -rf ./debs-from-release
-        mkdir -p ./debs-from-release
-        echo ">>> Downloading .deb files from release: ${RELEASE_TAG}"
-        gh release download "$RELEASE_TAG" \
-          --repo "${{ github.repository }}" \
-          --pattern "*.deb" \
-          --dir ./debs-from-release || true
-
-        count=$(find ./debs-from-release -type f -name '*.deb' | wc -l)
-        echo ">>> Downloaded ${count} .deb file(s)"
-        if [ "$count" -eq 0 ]; then
-          echo "::warning::Release ${RELEASE_TAG} has no .deb assets — nothing new to add"
+        done
+        if jq -e 'has("root-packages")' repo.json >/dev/null; then
+          jq 'del(.["root-packages"])' repo.json > repo.json.tmp && mv repo.json.tmp repo.json
         fi
+        jq -r 'keys[]' repo.json
 
-    # =================================================================
-    # 4. Validate the freshly-downloaded .deb files and copy valid ones
-    #    into docs/pool/main/<letter>/<pkg>/.
-    # =================================================================
-    - name: Validate and place downloaded .deb files into pool
+    - name: Patch prefix path + main app name
       run: |
         set -euo pipefail
-        POOL_ROOT="./docs/pool/main"
-        mkdir -p "$POOL_ROOT"
+        sed -i 's|^TERMUX_APP__PACKAGE_NAME=.*|TERMUX_APP__PACKAGE_NAME="app.xodos2"|' \
+          scripts/properties.sh
+        find . \
+          -path ./.git -prune -false -o \
+          -path ./.github -prune -false -o \
+          -path ./debs -prune -false -o \
+          -type f -print0 | \
+        xargs -0 -r -n50 sed -i 's|/data/data/com\.termux|/data/data/app.xodos2|g'
+        grep -nE '^TERMUX_APP__PACKAGE_NAME=' scripts/properties.sh
 
-        valid=0
-        invalid=0
-        shopt -s nullglob
-        for deb in ./debs-from-release/*.deb; do
-          if ! dpkg-deb -I "$deb" >/dev/null 2>&1; then
-            echo ">>> SKIPPING invalid .deb: $(basename "$deb")"
-            invalid=$((invalid + 1))
-            continue
-          fi
-
-          pkg_name=$(dpkg-deb -f "$deb" Package)
-          pkg_arch=$(dpkg-deb -f "$deb" Architecture)
-          first_letter=$(printf '%s' "$pkg_name" | cut -c1 | tr 'A-Z' 'a-z')
-          dest_dir="$POOL_ROOT/$first_letter/$pkg_name"
-          mkdir -p "$dest_dir"
-          cp -a "$deb" "$dest_dir/"
-          echo ">>> placed: $pkg_name [$pkg_arch] -> $dest_dir"
-          valid=$((valid + 1))
-        done
-        shopt -u nullglob
-
-        echo ""
-        echo ">>> valid=${valid} invalid=${invalid}"
-        echo ">>> total .deb in pool: $(find ./docs/pool -type f -name '*.deb' | wc -l)"
-
-    # =================================================================
-    # 5. Generate Packages indexes.
-    # =================================================================
-    - name: Generate Packages indexes with dpkg-scanpackages
+    - name: Override repository URL
       run: |
         set -euo pipefail
-        DIST="dists/stable"
-        COMP="main"
-
-        # Wipe old metadata so stale entries don't linger.
-        rm -rf "./docs/$DIST"
-
-        mkdir -p "./docs/$DIST/$COMP/binary-aarch64"
-        mkdir -p "./docs/$DIST/$COMP/binary-all"
-
-        # Empty override file silences the "missing from override" warning.
-        : > /tmp/override.empty
-
-        cd ./docs
-
-        echo ">>> Generating Packages for aarch64"
-        dpkg-scanpackages --multiversion pool/main /tmp/override.empty \
-          > "$DIST/$COMP/binary-aarch64/Packages"
-
-        echo ">>> Generating Packages for binary-all"
-        dpkg-scanpackages --multiversion --arch all pool/main /tmp/override.empty \
-          > "$DIST/$COMP/binary-all/Packages"
-
-        echo ""
-        echo ">>> aarch64 Packages entry count:"
-        grep -c '^Package:' "$DIST/$COMP/binary-aarch64/Packages" || true
-
-        echo ">>> binary-all Packages entry count:"
-        grep -c '^Package:' "$DIST/$COMP/binary-all/Packages" || true
-
-        echo ""
-        echo ">>> Sample Filename fields:"
-        grep '^Filename:' "$DIST/$COMP/binary-aarch64/Packages" > /tmp/filenames.txt || true
-        head -10 /tmp/filenames.txt || true
-
-    # =================================================================
-    # 6. Compress indexes.
-    # =================================================================
-    - name: Compress Packages indexes
-      run: |
-        set -euo pipefail
-        cd ./docs
-        for arch in aarch64 all; do
-          f="dists/stable/main/binary-$arch/Packages"
-          gzip -kf -9 "$f"
-          xz -kf -9 "$f"
-        done
-        echo ">>> index files:"
-        find dists/stable/main -maxdepth 2 -type f | sort
-
-    # =================================================================
-    # 7. Generate the Release file.
-    # =================================================================
-    - name: Generate Release file with apt-ftparchive
-      run: |
-        set -euo pipefail
-        cat > /tmp/apt-ftparchive-release.conf <<'EOF'
-        APT::FTPArchive::Release::Origin "xodiosx";
-        APT::FTPArchive::Release::Label "Termux-pkg-x";
-        APT::FTPArchive::Release::Suite "stable";
-        APT::FTPArchive::Release::Codename "stable";
-        APT::FTPArchive::Release::Architectures "aarch64 all";
-        APT::FTPArchive::Release::Components "main";
-        APT::FTPArchive::Release::Description "xodiosx custom Termux packages";
+        cat > "$HOME/.termuxrc" <<'EOF'
+        TERMUX_REPO_PACKAGE="app.xodos2"
+        TERMUX_REPO_URL=(
+          https://xodiosx.github.io/Termux-pkg-x
+        )
+        TERMUX_REPO_DISTRIBUTION=(
+          stable
+        )
+        TERMUX_REPO_COMPONENT=(
+          main
+        )
         EOF
+        cat "$HOME/.termuxrc"
 
-        cd ./docs
-        apt-ftparchive -c /tmp/apt-ftparchive-release.conf \
-          release dists/stable > dists/stable/Release
-        cp dists/stable/Release dists/stable/InRelease
-
-        echo ">>> Release file (first 40 lines):"
-        head -40 dists/stable/Release
-
-    # =================================================================
-    # 8. Sanity checks.
-    # =================================================================
-    - name: Verify repo layout
+    - name: Patch termux_download_deb_pac.sh
       run: |
         set -euo pipefail
-        echo ">>> docs/ top level:"
-        ls -la docs/
+        TDP="scripts/build/termux_download_deb_pac.sh"
+        [ -f "$TDP" ] || { echo "::error::$TDP not found"; exit 1; }
+        if ! grep -q 'FORCED-BY-CI-FORCE-SOURCE-BUILD' "$TDP"; then
+          sed -i '/^termux_download_deb_pac() {/a\    # FORCED-BY-CI-FORCE-SOURCE-BUILD: return failure' "$TDP"
+          sed -i '/FORCED-BY-CI-FORCE-SOURCE-BUILD: return failure/a\    return 1' "$TDP"
+        fi
 
-        echo ""
-        echo ">>> Packages Filename sanity (must start with 'pool/'):"
-        bad=0
-        while IFS= read -r line; do
-          case "$line" in
-            Filename:\ pool/*) : ;;
-            Filename:\ *) echo "  BAD: $line"; bad=$((bad+1)) ;;
-          esac
-        done < <(grep '^Filename:' docs/dists/stable/main/binary-aarch64/Packages || true)
-        if [ "$bad" -gt 0 ]; then
-          echo "::error::$bad Filename entries are not under pool/"
+    - name: Gather build summary
+      id: build-info
+      env:
+        MANUAL_INPUT_PACKAGES: ${{ github.event.inputs.packages }}
+      run: |
+        mkdir -p ./artifacts ./debs
+        touch ./debs/.placeholder
+
+        if [ "${{ github.event_name }}" != "workflow_dispatch" ]; then
+          if grep -qiP '^\s*%ci:no-build\s*$' <(git log --format="%B" -n 1 --no-merges "HEAD"); then
+            tar cf artifacts/debs-${{ matrix.target_arch }}.tar debs
+            echo "[!] %ci:no-build — exiting."; exit 0
+          fi
+        else
+          read -a PACKAGES <<< "${MANUAL_INPUT_PACKAGES//$'\n'/ }"
+          repo_paths=$(jq --raw-output 'del(.pkg_format) | keys | .[]' repo.json)
+          declare -a resolved=()
+          for pkg in "${PACKAGES[@]}"; do
+            [ -z "$pkg" ] && continue
+            for repo_path in $repo_paths; do
+              repo=$(jq --raw-output '.["'${repo_path}'"].name' repo.json)
+              if [ -d "${repo_path}/${pkg}" ]; then
+                echo "$pkg" >> ./built_${repo}_packages.txt
+                for subpkg in $(find "${repo_path}/${pkg}/" -maxdepth 1 -type f -name \*.subpackage.sh | sort); do
+                  echo "$(basename "${subpkg%%.subpackage.sh}")" >> ./built_${repo}_subpackages.txt
+                done
+                resolved+=("$pkg"); break
+              fi
+            done
+          done
+          echo ">>> resolved ${#resolved[@]}: ${resolved[*]:-<none>}"
+          [ "${#resolved[@]}" -eq 0 ] && { echo "::error::None found."; exit 1; }
+        fi
+
+        declare -a packages=()
+        for repo_path in $(jq --raw-output 'del(.pkg_format) | keys | .[]' repo.json); do
+          repo=$(jq --raw-output '.["'${repo_path}'"].name' repo.json)
+          [ -f "./built_${repo}_packages.txt" ] && packages+=($(cat "./built_${repo}_packages.txt"))
+        done
+        echo "packages: ${packages[*]}"
+
+    - name: Lint packages
+      run: |
+        declare -a package_recipes=()
+        for repo_path in $(jq --raw-output 'del(.pkg_format) | keys | .[]' repo.json); do
+          repo=$(jq --raw-output '.["'${repo_path}'"].name' repo.json)
+          [ -f "./built_${repo}_packages.txt" ] && package_recipes+=($(cat "./built_${repo}_packages.txt" | repo_path="${repo_path}" awk '{print ENVIRON["repo_path"]"/"$1"/build.sh"}'))
+        done
+        [[ "${#package_recipes[@]}" -gt 0 ]] && ./scripts/lint-packages.sh "${package_recipes[@]}"
+
+    - name: Enable zram
+      uses: ./.github/actions/zram
+      with:
+        algorithm: zstd
+        size: 16G
+        priority: 100
+        device_name: /dev/zram0
+
+    - name: Load Docker image
+      if: ${{ steps.build-info.outputs.free-space == 'true' }}
+      run: ./scripts/run-docker.sh true
+
+    - name: Free additional disk space
+      if: ${{ steps.build-info.outputs.free-space == 'true' }}
+      run: ./scripts/free-space.sh
+
+    - name: Build packages
+      run: |
+        declare -a packages=()
+        for repo_path in $(jq --raw-output 'del(.pkg_format) | keys | .[]' repo.json); do
+          repo=$(jq --raw-output '.["'${repo_path}'"].name' repo.json)
+          if [ -f "./built_${repo}_packages.txt" ]; then
+            packages+=($(cat "./built_${repo}_packages.txt"))
+          fi
+        done
+        PKGS_STR="${packages[*]}"
+        echo "packages: ${PKGS_STR}"
+
+        if [[ "${#packages[@]}" -gt 0 ]]; then
+          cat > /tmp/inner-build.sh <<'INNER_EOF'
+        set -e
+        PREFIX=/data/data/app.xodos2/files/usr
+        BUILD_ROOT=/home/builder/termux-packages
+        cd "$BUILD_ROOT"
+        mkdir -p "$PREFIX/var/lib/dpkg/info"
+        echo ">>> Building: __PKGS_PLACEHOLDER__"
+        cd "$BUILD_ROOT"
+        ./build-package.sh -C -a aarch64 __PKGS_PLACEHOLDER__
+        INNER_EOF
+          sed -i "s|__PKGS_PLACEHOLDER__|${PKGS_STR}|g" /tmp/inner-build.sh
+          ENCODED=$(base64 -w0 /tmp/inner-build.sh)
+          ./scripts/run-docker.sh -d bash -c "echo '${ENCODED}' | base64 -d | bash" \
+            || echo "::warning::Some packages failed to build — continuing"
+        fi
+
+    - name: Generate build artifacts
+      if: always()
+      run: |
+        test -d termux-packages/output && mv termux-packages/output/* ./output/ 2>/dev/null || true
+        for repo in $(jq --raw-output 'del(.pkg_format) | .[].name' repo.json); do
+          test -f ./built_${repo}_packages.txt && mv ./built_${repo}_packages.txt ./debs/
+          test -f ./built_${repo}_subpackages.txt && cat ./built_${repo}_subpackages.txt >> ./debs/built_${repo}_packages.txt && rm ./built_${repo}_subpackages.txt
+          if [ -f "./debs/built_${repo}_packages.txt" ] && [ -d "output" ]; then
+            while read -r pkg; do
+              find output \( -name "$pkg_*.deb" -o -name "$pkg-static_*.deb" \) -type f -print0 | xargs -0r mv -t debs/
+            done < <(cat "./debs/built_${repo}_packages.txt")
+          fi
+        done
+        echo ">>> debs/ contains: $(find debs -type f -name '*.deb' | wc -l) .deb files"
+        tar cf artifacts/debs-${{ matrix.target_arch }}-${{ github.sha }}.tar debs
+
+    - name: Store *.deb files
+      if: always()
+      uses: actions/upload-artifact@v6
+      with:
+        name: debs-${{ matrix.target_arch }}-${{ github.sha }}
+        path: ./artifacts
+
+  release:
+    permissions:
+      contents: write
+    needs: [build, prepare-release]
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-24.04
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+    - uses: actions/checkout@v6
+      with: { fetch-depth: 1 }
+
+    - uses: actions/download-artifact@v7
+      with: { path: ./all-artifacts }
+
+    - name: Extract .deb files from tarballs
+      run: |
+        set -euo pipefail
+        mkdir -p release-debs
+        shopt -s nullglob
+        for archive in all-artifacts/debs-*/debs-*.tar; do
+          tar xf "$archive" -C release-debs
+        done
+        count=$(find release-debs -type f -name '*.deb' | wc -l)
+        echo ">>> found ${count} .deb files"
+        if [ "$count" -eq 0 ]; then
+          echo "::error::No .deb files found in artifacts"
           exit 1
         fi
-        echo "  All Filename entries start with 'pool/' — OK"
 
-        echo ""
-        echo ">>> Total .deb in pool: $(find docs/pool -name '*.deb' | wc -l)"
-
-    # =================================================================
-    # 9. Commit & push.
-    # =================================================================
-    - name: Commit & push docs
+    - name: Upload .deb files (serialized, with retries)
       run: |
         set -euo pipefail
-        git config user.name "github-actions[bot]"
-        git config user.email "github-actions[bot]@users.noreply.github.com"
-        git add -A docs/
-        if git diff --cached --quiet; then
-          echo ">>> no changes — skipping commit"
-        else
-          git commit -m "Update APT repository from release ${{ inputs.release_tag }} [skip ci]"
-          git push
-        fi
+        TAG="${{ needs.prepare-release.outputs.tag }}"
+        mapfile -t FILES < <(find release-debs -type f -name '*.deb' | sort)
+        total="${#FILES[@]}"
+        i=0; failed=0
+        for f in "${FILES[@]}"; do
+          i=$((i + 1))
+          printf '[%d/%d] %s ... ' "$i" "$total" "$(basename "$f")"
+          ok=0
+          for attempt in 1 2 3 4 5; do
+            if gh release upload "$TAG" "$f" --clobber 2>/tmp/gh_err.log; then ok=1; break; fi
+            if grep -qiE 'secondary rate limit|abuse|rate limit' /tmp/gh_err.log; then
+              backoff=$((attempt * 15)); echo; echo "  ↳ rate limited, sleep ${backoff}s"; sleep "$backoff"
+            else
+              backoff=$((attempt * 3)); echo; echo "  ↳ retry in ${backoff}s"; cat /tmp/gh_err.log || true; sleep "$backoff"
+            fi
+          done
+          if [ "$ok" -eq 1 ]; then echo ok; else echo "FAILED: $(basename "$f")"; failed=$((failed + 1)); fi
+          sleep 1
+        done
+        [ "$failed" -gt 0 ] && { echo "::error::${failed}/${total} failed"; exit 1; }
+        echo ">>> all ${total} uploaded"
 
-    - name: Summary
+    - name: Verify release assets
       run: |
-        {
-          echo "## APT Repository Generated"
-          echo ""
-          echo "- **Release:** \`${{ inputs.release_tag }}\`"
-          echo "- **keep_old:** \`${{ inputs.keep_old }}\`"
-          echo "- **Repo URL:** https://xodiosx.github.io/Termux-pkg-x"
-          echo "- **Packages index:** https://xodiosx.github.io/Termux-pkg-x/dists/stable/main/binary-aarch64/Packages"
-          echo "- **Release file:** https://xodiosx.github.io/Termux-pkg-x/dists/stable/Release"
-          echo ""
-          echo "### Verify"
-          echo '```'
-          echo "curl -sL https://xodiosx.github.io/Termux-pkg-x/dists/stable/main/binary-aarch64/Packages | grep '^Filename:' | head"
-          echo '```'
-        } >> $GITHUB_STEP_SUMMARY
+        TAG="${{ needs.prepare-release.outputs.tag }}"
+        count=$(gh release view "$TAG" --json assets --jq '.assets | length')
+        echo ">>> release ${TAG} has ${count} assets"
