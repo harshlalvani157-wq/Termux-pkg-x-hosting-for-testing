@@ -8,7 +8,7 @@ on:
         required: true
         type: string
       keep_old:
-        description: "Keep .deb files already in docs/pool/ from previous runs"
+        description: "Keep valid .deb files already in docs/pool/ from previous runs (corrupt ones are always pruned)"
         type: boolean
         default: true
 
@@ -34,6 +34,48 @@ jobs:
         sudo apt-get update -qq
         sudo apt-get install -y -qq dpkg-dev apt-utils xz-utils zstd
 
+    # =================================================================
+    # 1. If keep_old=false, wipe the entire pool first.
+    # =================================================================
+    - name: Optionally wipe existing pool
+      if: ${{ inputs.keep_old != 'true' }}
+      run: |
+        set -euo pipefail
+        echo ">>> keep_old=false — wiping docs/pool and docs/dists"
+        rm -rf ./docs/pool ./docs/dists
+
+    # =================================================================
+    # 2. Prune corrupt .deb files already in docs/pool (always runs).
+    #    This kills leftover 404-HTML-saved-as-.deb from old runs.
+    # =================================================================
+    - name: Prune corrupt .deb files in docs/pool
+      run: |
+        set -euo pipefail
+        if [ ! -d ./docs/pool ]; then
+          echo ">>> docs/pool does not exist — nothing to prune"
+          exit 0
+        fi
+
+        removed=0
+        kept=0
+        while IFS= read -r -d '' deb; do
+          if dpkg-deb -I "$deb" >/dev/null 2>&1; then
+            kept=$((kept + 1))
+          else
+            echo ">>> PRUNING corrupt .deb: $deb"
+            rm -f "$deb"
+            removed=$((removed + 1))
+          fi
+        done < <(find ./docs/pool -type f -name '*.deb' -print0)
+
+        echo ">>> pruned ${removed} corrupt .deb file(s); kept ${kept} valid"
+
+        # Remove now-empty directories
+        find ./docs/pool -mindepth 1 -type d -empty -delete 2>/dev/null || true
+
+    # =================================================================
+    # 3. Download .deb files from the selected release.
+    # =================================================================
     - name: Download .deb files from release
       env:
         GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -46,72 +88,92 @@ jobs:
         gh release download "$RELEASE_TAG" \
           --repo "${{ github.repository }}" \
           --pattern "*.deb" \
-          --dir ./debs-from-release
+          --dir ./debs-from-release || true
+
         count=$(find ./debs-from-release -type f -name '*.deb' | wc -l)
-        echo ">>> Downloaded ${count} .deb files"
+        echo ">>> Downloaded ${count} .deb file(s)"
         if [ "$count" -eq 0 ]; then
-          echo "::error::No .deb files found in release ${RELEASE_TAG}"
-          exit 1
+          echo "::warning::Release ${RELEASE_TAG} has no .deb assets — nothing new to add"
         fi
 
-    - name: Build pool/ tree (proper Debian layout)
+    # =================================================================
+    # 4. Validate the freshly-downloaded .deb files and copy valid ones
+    #    into docs/pool/main/<letter>/<pkg>/.
+    # =================================================================
+    - name: Validate and place downloaded .deb files into pool
       run: |
         set -euo pipefail
         POOL_ROOT="./docs/pool/main"
-
-        if [ "${{ inputs.keep_old }}" != "true" ]; then
-          echo ">>> keep_old=false — wiping existing docs/pool"
-          rm -rf ./docs/pool
-        fi
         mkdir -p "$POOL_ROOT"
 
+        valid=0
+        invalid=0
+        shopt -s nullglob
         for deb in ./debs-from-release/*.deb; do
+          if ! dpkg-deb -I "$deb" >/dev/null 2>&1; then
+            echo ">>> SKIPPING invalid .deb: $(basename "$deb")"
+            invalid=$((invalid + 1))
+            continue
+          fi
+
           pkg_name=$(dpkg-deb -f "$deb" Package)
           pkg_arch=$(dpkg-deb -f "$deb" Architecture)
           first_letter=$(printf '%s' "$pkg_name" | cut -c1 | tr 'A-Z' 'a-z')
           dest_dir="$POOL_ROOT/$first_letter/$pkg_name"
           mkdir -p "$dest_dir"
-          cp -a -n "$deb" "$dest_dir/" 2>/dev/null || cp -a "$deb" "$dest_dir/"
-          echo ">>> pool: $pkg_name [$pkg_arch] -> $dest_dir"
+          cp -a "$deb" "$dest_dir/"
+          echo ">>> placed: $pkg_name [$pkg_arch] -> $dest_dir"
+          valid=$((valid + 1))
         done
+        shopt -u nullglob
 
         echo ""
-        echo ">>> docs/pool tree (first 40 entries):"
-        find ./docs/pool -mindepth 1 -maxdepth 3 -type d | sort > /tmp/pool-tree.txt
-        head -40 /tmp/pool-tree.txt
+        echo ">>> valid=${valid} invalid=${invalid}"
+        echo ">>> total .deb in pool: $(find ./docs/pool -type f -name '*.deb' | wc -l)"
 
+    # =================================================================
+    # 5. Generate Packages indexes.
+    # =================================================================
     - name: Generate Packages indexes with dpkg-scanpackages
       run: |
         set -euo pipefail
         DIST="dists/stable"
         COMP="main"
 
+        # Wipe old metadata so stale entries don't linger.
+        rm -rf "./docs/$DIST"
+
         mkdir -p "./docs/$DIST/$COMP/binary-aarch64"
         mkdir -p "./docs/$DIST/$COMP/binary-all"
 
-        # Empty override file silences "Packages in archive but missing from override file"
+        # Empty override file silences the "missing from override" warning.
         : > /tmp/override.empty
 
         cd ./docs
 
-        echo ">>> Generating Packages for aarch64 (includes arch:all)"
+        echo ">>> Generating Packages for aarch64"
         dpkg-scanpackages --multiversion pool/main /tmp/override.empty \
           > "$DIST/$COMP/binary-aarch64/Packages"
 
-        echo ">>> Generating Packages for binary-all only"
+        echo ">>> Generating Packages for binary-all"
         dpkg-scanpackages --multiversion --arch all pool/main /tmp/override.empty \
           > "$DIST/$COMP/binary-all/Packages"
 
         echo ""
-        echo ">>> Sample of aarch64 Packages (first 20 lines):"
-        head -20 "$DIST/$COMP/binary-aarch64/Packages" > /tmp/pkg-head.txt
-        cat /tmp/pkg-head.txt
+        echo ">>> aarch64 Packages entry count:"
+        grep -c '^Package:' "$DIST/$COMP/binary-aarch64/Packages" || true
+
+        echo ">>> binary-all Packages entry count:"
+        grep -c '^Package:' "$DIST/$COMP/binary-all/Packages" || true
 
         echo ""
         echo ">>> Sample Filename fields:"
-        grep '^Filename:' "$DIST/$COMP/binary-aarch64/Packages" > /tmp/filenames.txt
-        head -10 /tmp/filenames.txt
+        grep '^Filename:' "$DIST/$COMP/binary-aarch64/Packages" > /tmp/filenames.txt || true
+        head -10 /tmp/filenames.txt || true
 
+    # =================================================================
+    # 6. Compress indexes.
+    # =================================================================
     - name: Compress Packages indexes
       run: |
         set -euo pipefail
@@ -120,9 +182,13 @@ jobs:
           f="dists/stable/main/binary-$arch/Packages"
           gzip -kf -9 "$f"
           xz -kf -9 "$f"
-          ls -la "$f" "$f.gz" "$f.xz"
         done
+        echo ">>> index files:"
+        find dists/stable/main -maxdepth 2 -type f | sort
 
+    # =================================================================
+    # 7. Generate the Release file.
+    # =================================================================
     - name: Generate Release file with apt-ftparchive
       run: |
         set -euo pipefail
@@ -139,19 +205,19 @@ jobs:
         cd ./docs
         apt-ftparchive -c /tmp/apt-ftparchive-release.conf \
           release dists/stable > dists/stable/Release
-
-        echo ">>> Release file:"
-        cat dists/stable/Release
-
-        # InRelease = Release (unsigned) so apt can consume it without GPG
         cp dists/stable/Release dists/stable/InRelease
 
+        echo ">>> Release file (first 40 lines):"
+        head -40 dists/stable/Release
+
+    # =================================================================
+    # 8. Sanity checks.
+    # =================================================================
     - name: Verify repo layout
       run: |
         set -euo pipefail
-        echo ">>> Final docs/ tree (dirs, max depth 4):"
-        find docs -maxdepth 4 -type d | sort > /tmp/docs-tree.txt
-        head -50 /tmp/docs-tree.txt
+        echo ">>> docs/ top level:"
+        ls -la docs/
 
         echo ""
         echo ">>> Packages Filename sanity (must start with 'pool/'):"
@@ -161,7 +227,7 @@ jobs:
             Filename:\ pool/*) : ;;
             Filename:\ *) echo "  BAD: $line"; bad=$((bad+1)) ;;
           esac
-        done < <(grep '^Filename:' docs/dists/stable/main/binary-aarch64/Packages)
+        done < <(grep '^Filename:' docs/dists/stable/main/binary-aarch64/Packages || true)
         if [ "$bad" -gt 0 ]; then
           echo "::error::$bad Filename entries are not under pool/"
           exit 1
@@ -169,15 +235,17 @@ jobs:
         echo "  All Filename entries start with 'pool/' — OK"
 
         echo ""
-        echo ">>> Total .deb files in pool/:"
-        find docs/pool -name '*.deb' | wc -l
+        echo ">>> Total .deb in pool: $(find docs/pool -name '*.deb' | wc -l)"
 
+    # =================================================================
+    # 9. Commit & push.
+    # =================================================================
     - name: Commit & push docs
       run: |
         set -euo pipefail
         git config user.name "github-actions[bot]"
         git config user.email "github-actions[bot]@users.noreply.github.com"
-        git add docs/
+        git add -A docs/
         if git diff --cached --quiet; then
           echo ">>> no changes — skipping commit"
         else
@@ -191,6 +259,7 @@ jobs:
           echo "## APT Repository Generated"
           echo ""
           echo "- **Release:** \`${{ inputs.release_tag }}\`"
+          echo "- **keep_old:** \`${{ inputs.keep_old }}\`"
           echo "- **Repo URL:** https://xodiosx.github.io/Termux-pkg-x"
           echo "- **Packages index:** https://xodiosx.github.io/Termux-pkg-x/dists/stable/main/binary-aarch64/Packages"
           echo "- **Release file:** https://xodiosx.github.io/Termux-pkg-x/dists/stable/Release"
