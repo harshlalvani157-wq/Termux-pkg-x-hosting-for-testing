@@ -19,7 +19,6 @@ jobs:
       uses: actions/checkout@v6
       with:
         fetch-depth: 1
-        # Check out the branch that hosts /docs
         ref: master
 
     - name: Download .deb files from release
@@ -47,50 +46,58 @@ jobs:
         export PATH="$HOME/.local/bin:$PATH"
         termux-apt-repo --help
 
-    - name: Clean existing docs APT structure
+    - name: Manually construct pool/ directory
       run: |
         set -euo pipefail
-        # Remove old repo structure but keep website files (index.html etc.)
-        rm -rf docs/dists docs/pool
-        echo ">>> Cleaned docs/dists and docs/pool"
+        POOL_DIR="./docs/pool/main"
+        rm -rf "$POOL_DIR"
+        mkdir -p "$POOL_DIR"
 
-    - name: Generate APT repository structure
+        for deb in ./debs-from-release/*.deb; do
+          pkg_name=$(dpkg-deb -f "$deb" Package)
+          first_letter=$(echo "$pkg_name" | cut -c1 | tr 'A-Z' 'a-z')
+          dest_dir="$POOL_DIR/$first_letter/$pkg_name"
+          mkdir -p "$dest_dir"
+          cp -a "$deb" "$dest_dir/"
+          echo ">>> Placed $(basename "$deb") into $dest_dir"
+        done
+
+        echo ">>> pool/ tree (first 20 dirs):"
+        find "$POOL_DIR" -maxdepth 3 -type d | sort | head -20
+
+    - name: Generate dists/ metadata with termux-apt-repo
       run: |
         set -euo pipefail
         export PATH="$HOME/.local/bin:$PATH"
 
-        # Preserve existing website files by working in a temp dir
+        # Create a temporary directory that contains a symlink to the pool
+        # so termux-apt-repo can find the .deb files.
         mkdir -p ./repo-gen
-        touch ./repo-gen/.nojekyll
+        ln -sfn "$(pwd)/docs/pool" ./repo-gen/pool
+
         termux-apt-repo ./debs-from-release ./repo-gen stable main
 
-        echo ">>> Generated repo tree:"
-        find ./repo-gen -maxdepth 4 -type d | sort
+        echo ">>> Generated dists/ tree:"
+        find ./repo-gen/dists -maxdepth 4 -type d | sort
 
-        # Copy the generated dists/ and pool/ into docs/
+    - name: Copy dists/ into docs/
+      run: |
+        set -euo pipefail
+        rm -rf ./docs/dists
         cp -a ./repo-gen/dists ./docs/
-        cp -a ./repo-gen/pool  ./docs/
-        cp -a ./repo-gen/.nojekyll ./docs/ 2>/dev/null || true
 
-        echo ">>> docs/ now contains:"
-        ls -la ./docs/
-        echo ">>> dists/ contents:"
-        find docs/dists -maxdepth 4 -type f | head -20
-        echo ">>> pool/ contents (first 20):"
-        find docs/pool -type f | head -20
+        echo ">>> Final docs/ structure:"
+        find ./docs -maxdepth 4 -type d | sort
 
-    - name: Verify Packages index
+    - name: Verify Packages index points to pool/
       run: |
         set -euo pipefail
         PKG_FILE="docs/dists/stable/main/binary-aarch64/Packages"
         [ -f "$PKG_FILE" ] || { echo "::error::$PKG_FILE not found"; exit 1; }
-        echo ">>> First 30 lines of Packages:"
-        head -30 "$PKG_FILE"
-        echo ""
         echo ">>> Filename fields (should all start with pool/):"
         grep '^Filename:' "$PKG_FILE" | head -20
 
-    - name: Commit & push docs
+    - name: Commit & force-push docs
       run: |
         set -euo pipefail
         git config user.name "github-actions[bot]"
@@ -100,7 +107,7 @@ jobs:
           echo ">>> no changes — skipping commit"
         else
           git commit -m "Update APT repository from release ${{ inputs.release_tag }} [skip ci]"
-          git push
+          git push --force
         fi
 
     - name: Summary
