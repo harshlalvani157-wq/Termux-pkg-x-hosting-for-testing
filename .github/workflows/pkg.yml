@@ -71,14 +71,14 @@ jobs:
           first_letter=$(printf '%s' "$pkg_name" | cut -c1 | tr 'A-Z' 'a-z')
           dest_dir="$POOL_ROOT/$first_letter/$pkg_name"
           mkdir -p "$dest_dir"
-          # -n (no-clobber) so previous runs' files aren't overwritten if keep_old
           cp -a -n "$deb" "$dest_dir/" 2>/dev/null || cp -a "$deb" "$dest_dir/"
           echo ">>> pool: $pkg_name [$pkg_arch] -> $dest_dir"
         done
 
         echo ""
         echo ">>> docs/pool tree (first 40 entries):"
-        find ./docs/pool -mindepth 1 -maxdepth 3 -type d | sort | head -40
+        find ./docs/pool -mindepth 1 -maxdepth 3 -type d | sort > /tmp/pool-tree.txt
+        head -40 /tmp/pool-tree.txt
 
     - name: Generate Packages indexes with dpkg-scanpackages
       run: |
@@ -89,23 +89,28 @@ jobs:
         mkdir -p "./docs/$DIST/$COMP/binary-aarch64"
         mkdir -p "./docs/$DIST/$COMP/binary-all"
 
+        # Empty override file silences "Packages in archive but missing from override file"
+        : > /tmp/override.empty
+
         cd ./docs
 
-        # dpkg-scanpackages must run from the dir that contains pool/
-        # Output: Filename: pool/main/a/apt/apt_xxx.deb
         echo ">>> Generating Packages for aarch64 (includes arch:all)"
-        dpkg-scanpackages --multiversion pool/main /dev/null \
+        dpkg-scanpackages --multiversion pool/main /tmp/override.empty \
           > "$DIST/$COMP/binary-aarch64/Packages"
 
         echo ">>> Generating Packages for binary-all only"
-        dpkg-scanpackages --multiversion --arch all pool/main /dev/null \
+        dpkg-scanpackages --multiversion --arch all pool/main /tmp/override.empty \
           > "$DIST/$COMP/binary-all/Packages"
 
-        echo ">>> Sample of aarch64 Packages:"
-        head -20 "$DIST/$COMP/binary-aarch64/Packages"
+        echo ""
+        echo ">>> Sample of aarch64 Packages (first 20 lines):"
+        head -20 "$DIST/$COMP/binary-aarch64/Packages" > /tmp/pkg-head.txt
+        cat /tmp/pkg-head.txt
+
         echo ""
         echo ">>> Sample Filename fields:"
-        grep '^Filename:' "$DIST/$COMP/binary-aarch64/Packages" | head -10
+        grep '^Filename:' "$DIST/$COMP/binary-aarch64/Packages" > /tmp/filenames.txt
+        head -10 /tmp/filenames.txt
 
     - name: Compress Packages indexes
       run: |
@@ -138,14 +143,15 @@ jobs:
         echo ">>> Release file:"
         cat dists/stable/Release
 
-        # InRelease = Release without PGP (since we have no signing key here)
+        # InRelease = Release (unsigned) so apt can consume it without GPG
         cp dists/stable/Release dists/stable/InRelease
 
     - name: Verify repo layout
       run: |
         set -euo pipefail
         echo ">>> Final docs/ tree (dirs, max depth 4):"
-        find docs -maxdepth 4 -type d | sort | head -50
+        find docs -maxdepth 4 -type d | sort > /tmp/docs-tree.txt
+        head -50 /tmp/docs-tree.txt
 
         echo ""
         echo ">>> Packages Filename sanity (must start with 'pool/'):"
