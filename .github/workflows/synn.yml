@@ -14,9 +14,27 @@ concurrency:
 
 jobs:
   sync-upstream:
-    runs-on: ubuntu-latest
+    # Pinned to 22.04 to rule out the ubuntu-latest → 24.04 image change.
+    # Once things are stable you can switch back to ubuntu-latest.
+    runs-on: ubuntu-22.04
 
     steps:
+      # ------------------------------------------------------------------
+      # 0. Sanity-check that the secret is actually visible to this job.
+      #    If this step fails, the problem is the secret, not the script.
+      # ------------------------------------------------------------------
+      - name: Verify GH_PUSH_TOKEN is present
+        env:
+          TOKEN: ${{ secrets.GH_PUSH_TOKEN }}
+        run: |
+          set -euo pipefail
+          echo "token length = ${#TOKEN}"
+          if [ -z "${TOKEN}" ]; then
+            echo "::error::GH_PUSH_TOKEN is empty or not visible to this repository."
+            echo "::error::Check: repo/org secret named exactly 'GH_PUSH_TOKEN', not an Environment secret, granted to this repo."
+            exit 1
+          fi
+
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
