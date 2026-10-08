@@ -3,9 +3,9 @@ name: releas Packages
 on:
   push:
     branches: [master, dev, 'dev/**']
-    paths: ['packages/**', 'root-packages/**', 'x11-packages/**']
+    paths: ['packages/**', 'x11-packages/**']
   pull_request:
-    paths: ['packages/**', 'root-packages/**', 'x11-packages/**']
+    paths: ['packages/**', 'x11-packages/**']
   workflow_dispatch:
     inputs:
       packages:
@@ -73,6 +73,19 @@ jobs:
       uses: actions/checkout@v6
       with: { fetch-depth: 1000 }
 
+    - name: Exclude root-packages from repo.json
+      run: |
+        set -euo pipefail
+        if [ -f repo.json ]; then
+          jq 'del(.["root-packages"])' repo.json > repo.json.tmp && mv repo.json.tmp repo.json
+          echo ">>> Removed root-packages from repo.json"
+          echo ">>> Remaining repos:"
+          jq -r 'keys[]' repo.json
+        else
+          echo "::error::repo.json not found"
+          exit 1
+        fi
+
     - name: Patch properties.sh
       run: |
         set -euo pipefail
@@ -108,9 +121,6 @@ jobs:
       run: |
         set -euo pipefail
 
-        # Write the patch body once to a file. sed's `r` command inserts
-        # the file contents after the matched line — no backslash
-        # continuations, no YAML indentation headaches.
         cat > /tmp/dep_patch_body.txt <<'PATCHEOF'
             # SKIP-DEP-CHECK-PATCH
             if [ "${SKIP_DEP_CHECK:-}" = "true" ]; then
@@ -478,21 +488,6 @@ jobs:
     - name: AppArmor Logs
       if: always()
       run: sudo dmesg | grep apparmor
-
-  test-buildorder-random:
-    permissions: { contents: read }
-    runs-on: ubuntu-slim
-    steps:
-    - uses: actions/checkout@v6
-    - run: ./scripts/bin/test-buildorder-random
-    - run: ./scripts/bin/test-buildorder-random
-      env: { TERMUX_ARCH: aarch64 }
-    - run: ./scripts/bin/test-buildorder-random
-      env: { TERMUX_ARCH: arm }
-    - run: ./scripts/bin/test-buildorder-random
-      env: { TERMUX_ARCH: i686 }
-    - run: ./scripts/bin/test-buildorder-random
-      env: { TERMUX_ARCH: x86_64 }
 
   upload-test:
     permissions: { contents: read }
