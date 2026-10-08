@@ -7,9 +7,17 @@ on:
         description: "Release tag to pull .deb files from (e.g. 2026.10.08-183521)"
         required: true
         type: string
+      keep_old:
+        description: "Keep .deb files already in docs/pool/ from previous runs"
+        type: boolean
+        default: true
 
 permissions:
   contents: write
+
+concurrency:
+  group: generate-repo
+  cancel-in-progress: false
 
 jobs:
   generate-repo:
@@ -21,12 +29,18 @@ jobs:
         fetch-depth: 1
         ref: master
 
+    - name: Install tools
+      run: |
+        sudo apt-get update -qq
+        sudo apt-get install -y -qq dpkg-dev apt-utils xz-utils zstd
+
     - name: Download .deb files from release
       env:
         GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         RELEASE_TAG: ${{ inputs.release_tag }}
       run: |
         set -euo pipefail
+        rm -rf ./debs-from-release
         mkdir -p ./debs-from-release
         echo ">>> Downloading .deb files from release: ${RELEASE_TAG}"
         gh release download "$RELEASE_TAG" \
@@ -40,64 +54,119 @@ jobs:
           exit 1
         fi
 
-    - name: Install termux-apt-repo
-      run: |
-        pip3 install --user termux-apt-repo
-        export PATH="$HOME/.local/bin:$PATH"
-        termux-apt-repo --help
-
-    - name: Manually construct pool/ directory
+    - name: Build pool/ tree (proper Debian layout)
       run: |
         set -euo pipefail
-        POOL_DIR="./docs/pool/main"
-        rm -rf "$POOL_DIR"
-        mkdir -p "$POOL_DIR"
+        POOL_ROOT="./docs/pool/main"
+
+        if [ "${{ inputs.keep_old }}" != "true" ]; then
+          echo ">>> keep_old=false — wiping existing docs/pool"
+          rm -rf ./docs/pool
+        fi
+        mkdir -p "$POOL_ROOT"
 
         for deb in ./debs-from-release/*.deb; do
           pkg_name=$(dpkg-deb -f "$deb" Package)
-          first_letter=$(echo "$pkg_name" | cut -c1 | tr 'A-Z' 'a-z')
-          dest_dir="$POOL_DIR/$first_letter/$pkg_name"
+          pkg_arch=$(dpkg-deb -f "$deb" Architecture)
+          first_letter=$(printf '%s' "$pkg_name" | cut -c1 | tr 'A-Z' 'a-z')
+          dest_dir="$POOL_ROOT/$first_letter/$pkg_name"
           mkdir -p "$dest_dir"
-          cp -a "$deb" "$dest_dir/"
-          echo ">>> Placed $(basename "$deb") into $dest_dir"
+          # -n (no-clobber) so previous runs' files aren't overwritten if keep_old
+          cp -a -n "$deb" "$dest_dir/" 2>/dev/null || cp -a "$deb" "$dest_dir/"
+          echo ">>> pool: $pkg_name [$pkg_arch] -> $dest_dir"
         done
 
-        echo ">>> pool/ tree (first 20 dirs):"
-        find "$POOL_DIR" -maxdepth 3 -type d | sort | head -20
+        echo ""
+        echo ">>> docs/pool tree (first 40 entries):"
+        find ./docs/pool -mindepth 1 -maxdepth 3 -type d | sort | head -40
 
-    - name: Generate dists/ metadata with termux-apt-repo
+    - name: Generate Packages indexes with dpkg-scanpackages
       run: |
         set -euo pipefail
-        export PATH="$HOME/.local/bin:$PATH"
+        DIST="dists/stable"
+        COMP="main"
 
-        # Create a temporary directory that contains a symlink to the pool
-        # so termux-apt-repo can find the .deb files.
-        mkdir -p ./repo-gen
-        ln -sfn "$(pwd)/docs/pool" ./repo-gen/pool
+        mkdir -p "./docs/$DIST/$COMP/binary-aarch64"
+        mkdir -p "./docs/$DIST/$COMP/binary-all"
 
-        termux-apt-repo ./debs-from-release ./repo-gen stable main
+        cd ./docs
 
-        echo ">>> Generated dists/ tree:"
-        find ./repo-gen/dists -maxdepth 4 -type d | sort
+        # dpkg-scanpackages must run from the dir that contains pool/
+        # Output: Filename: pool/main/a/apt/apt_xxx.deb
+        echo ">>> Generating Packages for aarch64 (includes arch:all)"
+        dpkg-scanpackages --multiversion pool/main /dev/null \
+          > "$DIST/$COMP/binary-aarch64/Packages"
 
-    - name: Copy dists/ into docs/
+        echo ">>> Generating Packages for binary-all only"
+        dpkg-scanpackages --multiversion --arch all pool/main /dev/null \
+          > "$DIST/$COMP/binary-all/Packages"
+
+        echo ">>> Sample of aarch64 Packages:"
+        head -20 "$DIST/$COMP/binary-aarch64/Packages"
+        echo ""
+        echo ">>> Sample Filename fields:"
+        grep '^Filename:' "$DIST/$COMP/binary-aarch64/Packages" | head -10
+
+    - name: Compress Packages indexes
       run: |
         set -euo pipefail
-        rm -rf ./docs/dists
-        cp -a ./repo-gen/dists ./docs/
+        cd ./docs
+        for arch in aarch64 all; do
+          f="dists/stable/main/binary-$arch/Packages"
+          gzip -kf -9 "$f"
+          xz -kf -9 "$f"
+          ls -la "$f" "$f.gz" "$f.xz"
+        done
 
-        echo ">>> Final docs/ structure:"
-        find ./docs -maxdepth 4 -type d | sort
-
-    - name: Verify Packages index points to pool/
+    - name: Generate Release file with apt-ftparchive
       run: |
         set -euo pipefail
-        PKG_FILE="docs/dists/stable/main/binary-aarch64/Packages"
-        [ -f "$PKG_FILE" ] || { echo "::error::$PKG_FILE not found"; exit 1; }
-        echo ">>> Filename fields (should all start with pool/):"
-        grep '^Filename:' "$PKG_FILE" | head -20
+        cat > /tmp/apt-ftparchive-release.conf <<'EOF'
+        APT::FTPArchive::Release::Origin "xodiosx";
+        APT::FTPArchive::Release::Label "Termux-pkg-x";
+        APT::FTPArchive::Release::Suite "stable";
+        APT::FTPArchive::Release::Codename "stable";
+        APT::FTPArchive::Release::Architectures "aarch64 all";
+        APT::FTPArchive::Release::Components "main";
+        APT::FTPArchive::Release::Description "xodiosx custom Termux packages";
+        EOF
 
-    - name: Commit & force-push docs
+        cd ./docs
+        apt-ftparchive -c /tmp/apt-ftparchive-release.conf \
+          release dists/stable > dists/stable/Release
+
+        echo ">>> Release file:"
+        cat dists/stable/Release
+
+        # InRelease = Release without PGP (since we have no signing key here)
+        cp dists/stable/Release dists/stable/InRelease
+
+    - name: Verify repo layout
+      run: |
+        set -euo pipefail
+        echo ">>> Final docs/ tree (dirs, max depth 4):"
+        find docs -maxdepth 4 -type d | sort | head -50
+
+        echo ""
+        echo ">>> Packages Filename sanity (must start with 'pool/'):"
+        bad=0
+        while IFS= read -r line; do
+          case "$line" in
+            Filename:\ pool/*) : ;;
+            Filename:\ *) echo "  BAD: $line"; bad=$((bad+1)) ;;
+          esac
+        done < <(grep '^Filename:' docs/dists/stable/main/binary-aarch64/Packages)
+        if [ "$bad" -gt 0 ]; then
+          echo "::error::$bad Filename entries are not under pool/"
+          exit 1
+        fi
+        echo "  All Filename entries start with 'pool/' — OK"
+
+        echo ""
+        echo ">>> Total .deb files in pool/:"
+        find docs/pool -name '*.deb' | wc -l
+
+    - name: Commit & push docs
       run: |
         set -euo pipefail
         git config user.name "github-actions[bot]"
@@ -107,18 +176,21 @@ jobs:
           echo ">>> no changes — skipping commit"
         else
           git commit -m "Update APT repository from release ${{ inputs.release_tag }} [skip ci]"
-          git push --force
+          git push
         fi
 
     - name: Summary
       run: |
-        echo "## APT Repository Generated" >> $GITHUB_STEP_SUMMARY
-        echo "" >> $GITHUB_STEP_SUMMARY
-        echo "- **Release:** \`${{ inputs.release_tag }}\`" >> $GITHUB_STEP_SUMMARY
-        echo "- **Repo URL:** https://xodiosx.github.io/Termux-pkg-x" >> $GITHUB_STEP_SUMMARY
-        echo "- **Packages index:** https://xodiosx.github.io/Termux-pkg-x/dists/stable/main/binary-aarch64/Packages" >> $GITHUB_STEP_SUMMARY
-        echo "" >> $GITHUB_STEP_SUMMARY
-        echo "### Verify" >> $GITHUB_STEP_SUMMARY
-        echo '```' >> $GITHUB_STEP_SUMMARY
-        echo "curl -sL https://xodiosx.github.io/Termux-pkg-x/dists/stable/main/binary-aarch64/Packages | head -20" >> $GITHUB_STEP_SUMMARY
-        echo '```' >> $GITHUB_STEP_SUMMARY
+        {
+          echo "## APT Repository Generated"
+          echo ""
+          echo "- **Release:** \`${{ inputs.release_tag }}\`"
+          echo "- **Repo URL:** https://xodiosx.github.io/Termux-pkg-x"
+          echo "- **Packages index:** https://xodiosx.github.io/Termux-pkg-x/dists/stable/main/binary-aarch64/Packages"
+          echo "- **Release file:** https://xodiosx.github.io/Termux-pkg-x/dists/stable/Release"
+          echo ""
+          echo "### Verify"
+          echo '```'
+          echo "curl -sL https://xodiosx.github.io/Termux-pkg-x/dists/stable/main/binary-aarch64/Packages | grep '^Filename:' | head"
+          echo '```'
+        } >> $GITHUB_STEP_SUMMARY
