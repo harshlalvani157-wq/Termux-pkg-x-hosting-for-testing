@@ -90,7 +90,6 @@ jobs:
           -path ./debs -prune -false -o \
           -type f -print0 | \
         xargs -0 -r -n50 sed -i 's|/data/data/com\.termux|/data/data/app.xodos2|g'
-        echo ">>> TERMUX_APP__PACKAGE_NAME:"
         grep -nE '^TERMUX_APP__PACKAGE_NAME=' scripts/properties.sh
 
     - name: Override repository URL
@@ -133,38 +132,15 @@ jobs:
             tar cf artifacts/debs-${{ matrix.target_arch }}.tar debs
             echo "[!] %ci:no-build — exiting."; exit 0
           fi
-          for repo_path in $(jq --raw-output 'del(.pkg_format) | keys | .[]' repo.json); do
-            repo=$(jq --raw-output '.["'${repo_path}'"].name' repo.json)
-            while read -r file; do
-              if ! [[ $file == ${repo_path}/* ]]; then continue; fi
-              if [[ $file =~ ^${repo_path}/([.a-z0-9+-]*)/([.a-z0-9+-]*).subpackage.sh$ ]]; then
-                pkg=${BASH_REMATCH[1]}; subpkg=${BASH_REMATCH[2]}
-                [ ! -f "${repo_path}/${pkg}/${subpkg}.subpackage.sh" ] && echo "$subpkg" >> ./deleted_${repo}_packages.txt
-              elif [[ $file =~ ^${repo_path}/([.a-z0-9+-]*)/.*$ ]]; then
-                pkg=${BASH_REMATCH[1]}
-                if [ -d "${repo_path}/${pkg}" ]; then
-                  echo "$pkg" >> ./built_${repo}_packages.txt
-                  for file in $(find "${repo_path}/${pkg}/" -maxdepth 1 -type f -name \*.subpackage.sh | sort); do
-                    echo "$(basename "${file%%.subpackage.sh}")" >> ./built_${repo}_subpackages.txt
-                  done
-                else
-                  echo "$pkg" >> ./deleted_${repo}_packages
-                fi
-              fi
-            done<<<${CHANGED_FILES}
-          done
         else
           read -a PACKAGES <<< "${MANUAL_INPUT_PACKAGES//$'\n'/ }"
           repo_paths=$(jq --raw-output 'del(.pkg_format) | keys | .[]' repo.json)
           declare -a resolved=()
-          declare -a missing=()
           for pkg in "${PACKAGES[@]}"; do
             [ -z "$pkg" ] && continue
-            found=false
             for repo_path in $repo_paths; do
               repo=$(jq --raw-output '.["'${repo_path}'"].name' repo.json)
               if [ -d "${repo_path}/${pkg}" ]; then
-                found=true
                 echo "$pkg" >> ./built_${repo}_packages.txt
                 for subpkg in $(find "${repo_path}/${pkg}/" -maxdepth 1 -type f -name \*.subpackage.sh | sort); do
                   echo "$(basename "${subpkg%%.subpackage.sh}")" >> ./built_${repo}_subpackages.txt
@@ -172,17 +148,10 @@ jobs:
                 resolved+=("$pkg"); break
               fi
             done
-            [ "$found" = true ] && continue
-            missing+=("$pkg")
           done
           echo ">>> resolved ${#resolved[@]}: ${resolved[*]:-<none>}"
           [ "${#resolved[@]}" -eq 0 ] && { echo "::error::None found."; exit 1; }
         fi
-
-        for repo in $(jq --raw-output 'del(.pkg_format) | .[].name' repo.json); do
-          [ -f ./built_${repo}_packages.txt ]    && { sort ./built_${repo}_packages.txt    | uniq > ./tmp && mv ./tmp ./built_${repo}_packages.txt; }
-          [ -f ./built_${repo}_subpackages.txt ] && { sort ./built_${repo}_subpackages.txt | uniq > ./tmp && mv ./tmp ./built_${repo}_subpackages.txt; }
-        done
 
         declare -a packages=()
         for repo_path in $(jq --raw-output 'del(.pkg_format) | keys | .[]' repo.json); do
@@ -252,7 +221,6 @@ jobs:
         for repo in $(jq --raw-output 'del(.pkg_format) | .[].name' repo.json); do
           test -f ./built_${repo}_packages.txt && mv ./built_${repo}_packages.txt ./debs/
           test -f ./built_${repo}_subpackages.txt && cat ./built_${repo}_subpackages.txt >> ./debs/built_${repo}_packages.txt && rm ./built_${repo}_subpackages.txt
-          test -f ./deleted_${repo}_packages.txt && mv ./deleted_${repo}_packages.txt ./debs/
           if [ -f "./debs/built_${repo}_packages.txt" ] && [ -d "output" ]; then
             while read -r pkg; do
               find output \( -name "$pkg_*.deb" -o -name "$pkg-static_*.deb" \) -type f -print0 | xargs -0r mv -t debs/
@@ -268,17 +236,6 @@ jobs:
       with:
         name: debs-${{ matrix.target_arch }}-${{ github.sha }}
         path: ./artifacts
-
-    - name: Checksums for built *.deb files
-      if: always()
-      run: find debs -type f -name "*.deb" -exec sha256sum "{}" \; | sort -k2 | tee checksum-${{ matrix.target_arch }}-${{ github.sha }}.txt
-
-    - name: Store checksums
-      if: always()
-      uses: actions/upload-artifact@v6
-      with:
-        name: checksum-${{ matrix.target_arch }}-${{ github.sha }}
-        path: checksum-${{ matrix.target_arch }}-${{ github.sha }}.txt
 
   release:
     permissions:
