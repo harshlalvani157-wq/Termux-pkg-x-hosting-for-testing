@@ -14,14 +14,11 @@ concurrency:
 
 jobs:
   sync-upstream:
-    # Pinned to 22.04 to rule out the ubuntu-latest → 24.04 image change.
-    # Once things are stable you can switch back to ubuntu-latest.
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-latest
 
     steps:
       # ------------------------------------------------------------------
-      # 0. Sanity-check that the secret is actually visible to this job.
-      #    If this step fails, the problem is the secret, not the script.
+      # 0a. Sanity-check that the secret is actually visible to this job.
       # ------------------------------------------------------------------
       - name: Verify GH_PUSH_TOKEN is present
         env:
@@ -31,12 +28,29 @@ jobs:
           echo "token length = ${#TOKEN}"
           if [ -z "${TOKEN}" ]; then
             echo "::error::GH_PUSH_TOKEN is empty or not visible to this repository."
-            echo "::error::Check: repo/org secret named exactly 'GH_PUSH_TOKEN', not an Environment secret, granted to this repo."
             exit 1
           fi
 
+      # ------------------------------------------------------------------
+      # 0b. Update apt and (re)install git BEFORE checkout.
+      #     On the fresh ubuntu-latest image the preinstalled git /
+      #     credential helper has been reported to break actions/checkout
+      #     with "could not read Username ... terminal prompts disabled".
+      #     Reinstalling git from apt fixes that.
+      # ------------------------------------------------------------------
+      - name: Update packages and install git
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --reinstall \
+            git \
+            git-man \
+            ca-certificates
+          git --version
+          which git
+
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v4.2.2
         with:
           ref: master
           fetch-depth: 0
@@ -59,10 +73,7 @@ jobs:
           git checkout master
 
           # ------------------------------------------------------------------
-          # 1. Snapshot the paths we want to keep OUR version of, no matter
-          #    what upstream does. Right now that's just the workflow files.
-          #    Add more paths here if you have other files you edit locally
-          #    and never want overwritten.
+          # 1. Snapshot the paths we want to keep OUR version of.
           # ------------------------------------------------------------------
           KEEP_PATHS=(".github/workflows")
           mkdir -p /tmp/keep
@@ -76,10 +87,6 @@ jobs:
 
           # ------------------------------------------------------------------
           # 2. Reset every tracked file to upstream's version.
-          #    - Files shared with upstream  → upstream wins (this is the fix)
-          #    - Files only in our repo       → untouched (kept as-is)
-          #    - Files we deleted but up      → recreated from upstream
-          #      stream still has
           # ------------------------------------------------------------------
           git checkout upstream/master -- .
 
@@ -96,7 +103,7 @@ jobs:
           done
 
           # ------------------------------------------------------------------
-          # 4. Show what actually changed (nice for the run log).
+          # 4. Show what actually changed.
           # ------------------------------------------------------------------
           echo ">>> changes staged for this sync:"
           git add -A
