@@ -23,3 +23,7 @@
 # File syntax
 *.patch.beforehostbuild linguist-language=RAML
 *.patch.beforehostbuild linguist-language=Diff
+
+# Treat .deb files as binary
+*.deb binary
+*.ddeb binary
