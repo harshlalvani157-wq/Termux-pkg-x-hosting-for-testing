@@ -1,4 +1,4 @@
-name: Generate bootstrap XoDos 
+name: Generate bootstrap archives
 
 on:
   schedule:
@@ -164,7 +164,6 @@ jobs:
               for p in provides:
                   provides_map[p].append(name)
 
-          # Add every lib* package as a seed for this arch.
           for name, info in pkg_info.items():
               if name.startswith("lib"):
                   if info["arch"] == "all" or info["arch"] == ARCH:
@@ -263,7 +262,6 @@ jobs:
           done < selected-packages.txt
 
           echo ">>> copied ${kept} .deb files to debs/"
-          # FIXED: write to file, then head (avoids SIGPIPE under pipefail)
           ls debs/ > /tmp/debs-list.txt
           head -20 /tmp/debs-list.txt || true
 
@@ -292,11 +290,7 @@ jobs:
           done
           shopt -u nullglob
 
-          echo ">>> staging top-level:"
           ls -la "$STAGING"
-
-          echo ">>> staging/lib sample:"
-          # FIXED: file then head
           ls "$STAGING/lib/" > /tmp/lib-list.txt 2>/dev/null || true
           head -20 /tmp/lib-list.txt || true
 
