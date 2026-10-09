@@ -37,37 +37,60 @@ jobs:
         run: |
           set -euo pipefail
 
-          pick_tag_with_debs() {
-            # Emit the newest non-bootstrap release whose assets include *.deb
-            gh api "repos/${{ github.repository }}/releases?per_page=100" \
-              --jq '.[]
-                     | select(.tag_name | startswith("bootstrap-") | not)
-                     | select([.assets[].name] | any(endswith(".deb")))
-                     | .tag_name' \
-              | head -1
+          # Count .deb assets on a given release. Prints an integer.
+          count_debs() {
+            local tag="$1"
+            local n
+            n=$(gh release view "$tag" \
+                  --repo "${{ github.repository }}" \
+                  --json assets \
+                  --jq '[.assets[]?.name // empty] | map(select(endswith(".deb"))) | length' \
+                  2>/dev/null || echo "0")
+            echo "${n:-0}"
           }
 
           if [ -n "$INPUT_TAG" ]; then
             TAG="$INPUT_TAG"
-            # Verify it actually has .deb assets
-            count=$(gh api "repos/${{ github.repository }}/releases/tags/${TAG}" \
-                      --jq '[.assets[].name] | map(select(endswith(".deb"))) | length' 2>/dev/null || echo "0")
-            if [ "$count" = "0" ] || [ -z "$count" ]; then
+            echo ">>> user-provided tag: $TAG"
+            count=$(count_debs "$TAG")
+            echo ">>> .deb assets on $TAG: $count"
+            if [ "${count:-0}" -eq 0 ]; then
               echo "::error::Release '${TAG}' has no .deb assets"
+              echo ">>> assets on that release:"
               gh release view "$TAG" --repo "${{ github.repository }}" \
-                --json assets --jq '.assets[].name' || true
+                --json assets --jq '.assets[]?.name // empty' || true
               exit 1
             fi
-            echo ">>> Using user-provided tag: $TAG (${count} .deb assets)"
           else
-            TAG="$(pick_tag_with_debs)"
-            if [ -z "$TAG" ] || [ "$TAG" = "null" ]; then
-              echo "::error::No release with .deb assets found in this repo."
-              echo ">>> Available releases:"
-              gh release list --repo "${{ github.repository }}" --limit 20 || true
+            echo ">>> no input tag — searching releases for one with .deb assets"
+            mapfile -t TAGS < <(
+              gh release list --repo "${{ github.repository }}" \
+                --limit 200 \
+                --json tagName,createdAt \
+                --jq 'sort_by(.createdAt) | reverse | .[].tagName | select(startswith("bootstrap-") | not)'
+            )
+            if [ "${#TAGS[@]}" -eq 0 ]; then
+              echo "::error::No non-bootstrap releases in this repo."
               exit 1
             fi
-            echo ">>> Auto-selected newest release with .deb assets: $TAG"
+            echo ">>> ${#TAGS[@]} candidate tag(s); newest first:"
+            printf '    %s\n' "${TAGS[@]}"
+
+            TAG=""
+            for t in "${TAGS[@]}"; do
+              [ -z "$t" ] && continue
+              c=$(count_debs "$t")
+              echo "    $t -> ${c} .deb asset(s)"
+              if [ "${c:-0}" -gt 0 ]; then
+                TAG="$t"
+                break
+              fi
+            done
+            if [ -z "$TAG" ]; then
+              echo "::error::No release with .deb assets found."
+              exit 1
+            fi
+            echo ">>> picked: $TAG"
           fi
 
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
@@ -78,7 +101,7 @@ jobs:
             ARCHS=$(printf '%s' "$INPUT_ARCH" | python3 -c 'import sys, json; print(json.dumps([a.strip() for a in sys.stdin.read().split(",") if a.strip()]))')
           fi
           echo "archs=$ARCHS" >> "$GITHUB_OUTPUT"
-          echo ">>> Arches: $ARCHS"
+          echo ">>> arches: $ARCHS"
 
   build:
     needs: resolve
@@ -145,11 +168,10 @@ jobs:
 
           def dpkg_field(path, field):
               try:
-                  out = subprocess.check_output(
+                  return subprocess.check_output(
                       ["dpkg-deb", "-f", path, field],
                       stderr=subprocess.DEVNULL,
                   ).decode().strip()
-                  return out
               except subprocess.CalledProcessError:
                   return ""
 
@@ -178,16 +200,13 @@ jobs:
                           out.append(first)
                   return out
 
-              deps = parse_list(depends_raw)
-              provides = parse_list(provides_raw)
-
               pkg_info[name] = {
                   "path": path,
                   "arch": arch,
-                  "depends": deps,
-                  "provides": provides,
+                  "depends": parse_list(depends_raw),
+                  "provides": parse_list(provides_raw),
               }
-              for p in provides:
+              for p in parse_list(provides_raw):
                   provides_map[p].append(name)
 
           for name, info in pkg_info.items():
@@ -196,36 +215,27 @@ jobs:
                       if name not in essentials:
                           essentials.append(name)
 
-          needed = set()
-          queue = []
+          needed, queue = set(), []
           for e in essentials:
-              if e in pkg_info:
-                  needed.add(e)
-                  queue.append(e)
+              if e in pkg_info and e not in needed:
+                  needed.add(e); queue.append(e)
               elif e in provides_map:
                   for real in provides_map[e]:
                       if real not in needed:
-                          needed.add(real)
-                          queue.append(real)
+                          needed.add(real); queue.append(real)
 
           while queue:
-              current = queue.pop()
-              info = pkg_info.get(current)
+              cur = queue.pop()
+              info = pkg_info.get(cur)
               if not info:
                   continue
               for dep in info["depends"]:
-                  targets = []
-                  if dep in pkg_info:
-                      targets = [dep]
-                  elif dep in provides_map:
-                      targets = provides_map[dep]
+                  targets = [dep] if dep in pkg_info else provides_map.get(dep, [])
                   for t in targets:
                       if t not in needed:
-                          needed.add(t)
-                          queue.append(t)
+                          needed.add(t); queue.append(t)
 
-          keep = []
-          skip_arch = []
+          keep, skip_arch = [], []
           for name in sorted(needed):
               info = pkg_info[name]
               if info["arch"] == "all" or info["arch"] == ARCH:
@@ -272,11 +282,9 @@ jobs:
             for deb in all-debs/*.deb; do
               name=$(dpkg-deb -f "$deb" Package 2>/dev/null || echo "")
               arch=$(dpkg-deb -f "$deb" Architecture 2>/dev/null || echo "")
-              if [ "$name" = "$pkg" ]; then
-                if [ "$arch" = "all" ] || [ "$arch" = "$ARCH" ]; then
-                  found="$deb"
-                  break
-                fi
+              if [ "$name" = "$pkg" ] && { [ "$arch" = "all" ] || [ "$arch" = "$ARCH" ]; }; then
+                found="$deb"
+                break
               fi
             done
             if [ -n "$found" ]; then
@@ -358,11 +366,6 @@ jobs:
             > staging/etc/apt/sources.list
           cat staging/etc/apt/sources.list
 
-      # -----------------------------------------------------------------
-      # Overwrite the built termux-tools' mirrors/default so pkg doesn't
-      # fall back to the Termux mirror list. This is what fixes `pkg up`
-      # still showing termux mirrors.
-      # -----------------------------------------------------------------
       - name: Force pkg to use only our mirror
         run: |
           set -euo pipefail
@@ -374,11 +377,9 @@ jobs:
             echo "WEIGHT=10"
             echo 'MAIN="https://xodiosx.github.io/Termux-pkg-x"'
           } > "$D"
-          # Delete every other mirror file/folder
           find "$MIRROR_DIR" -mindepth 1 -type f ! -name default -delete 2>/dev/null || true
           find "$MIRROR_DIR" -mindepth 1 -type d -empty -delete 2>/dev/null || true
 
-          # If pkg is present, force no mirror selection
           PKG="staging/bin/pkg"
           if [ -f "$PKG" ]; then
             grep -q TERMUX_PKG_NO_MIRROR_SELECT "$PKG" || \
@@ -386,9 +387,7 @@ jobs:
             sed -i 's|deb \$MAIN|deb [trusted=yes] \$MAIN|g' "$PKG" || true
           fi
 
-          echo ">>> mirrors/ contents:"
           ls -la "$MIRROR_DIR"
-          echo ">>> mirrors/default:"
           cat "$D"
 
       - name: Disable signature verification + strip keyring
