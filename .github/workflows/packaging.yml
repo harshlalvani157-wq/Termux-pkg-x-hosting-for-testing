@@ -69,7 +69,6 @@ jobs:
       uses: actions/checkout@v6
       with: { fetch-depth: 1000 }
 
-    # FIX: also create ./output so the artifact-collection step can move files into it.
     - name: Ensure work directories exist
       run: mkdir -p ./artifacts ./debs ./output
 
@@ -316,11 +315,6 @@ jobs:
           exit 0
         fi
 
-        # ================================================================
-        # FIXES in the inner script:
-        #  1. rm -rf built-packages markers so each build actually runs
-        #  2. add -f to force rebuild
-        # ================================================================
         {
           echo 'set -uo pipefail'
           echo 'PREFIX=/data/data/app.xodos2/files/usr'
@@ -328,7 +322,6 @@ jobs:
           echo 'mkdir -p "$PREFIX/var/lib/dpkg/info"'
           echo 'cd "$BUILD_ROOT"'
           echo ''
-          echo '# 1. Wipe built-packages markers'
           echo 'echo ">>> wiping stale built-packages markers"'
           echo 'rm -rf /data/data/.built-packages 2>/dev/null || true'
           echo 'rm -rf /data/data/app.xodos2/.built-packages 2>/dev/null || true'
@@ -340,7 +333,6 @@ jobs:
           echo '  echo "=================================================="'
           echo '  echo ">>> Building: $pkg"'
           echo '  echo "=================================================="'
-          echo '  # 2. -f forces rebuild even if a marker sneaks in'
           echo '  if ./build-package.sh -C -f -a aarch64 "$pkg"; then'
           echo '    built+=("$pkg")'
           echo '    echo ">>> OK: $pkg"'
@@ -361,10 +353,6 @@ jobs:
         ENCODED=$(base64 -w0 /tmp/inner-build.sh)
         ./scripts/run-docker.sh -d bash -c "echo '${ENCODED}' | base64 -d | bash" || true
 
-    # =================================================================
-    # FIXED: collect from BOTH termux-packages/output and ./output,
-    #        and print exactly what landed in debs/.
-    # =================================================================
     - name: Generate build artifacts
       if: always()
       run: |
@@ -373,21 +361,19 @@ jobs:
 
         echo ">>> termux-packages/output contents:"
         if [ -d termux-packages/output ]; then
-          ls -la termux-packages/output | head -40 || true
+          find termux-packages/output -maxdepth 1 -type f | head -40 || true
           find termux-packages/output -maxdepth 1 -type f -print0 2>/dev/null \
             | xargs -0r mv -t ./output/ 2>/dev/null || true
-        else
-          echo "    (no termux-packages/output)"
         fi
 
         echo ">>> ./output contents:"
-        ls -la output | head -40 || true
+        find output -maxdepth 1 -type f | head -40 || true
 
-        # Copy every .deb into debs/ regardless of which built_*.txt files exist
+        # Copy every .deb from ./output into debs/
         find output -maxdepth 1 -type f -name '*.deb' -print0 2>/dev/null \
           | xargs -0r mv -t debs/ 2>/dev/null || true
 
-        # Also keep the built_*.txt lists that generate-repo uses
+        # Also move built_*.txt lists
         for repo in $(jq --raw-output 'del(.pkg_format) | .[].name' repo.json); do
           if [ -f "./built_${repo}_packages.txt" ]; then
             mv "./built_${repo}_packages.txt" ./debs/ || true
@@ -404,6 +390,7 @@ jobs:
         head -20 /tmp/debs-final.txt || true
 
         tar cf "artifacts/debs-${{ matrix.target_arch }}-${{ github.sha }}.tar" debs
+        echo ">>> tar contents (first 20):"
         tar tf "artifacts/debs-${{ matrix.target_arch }}-${{ github.sha }}.tar" | head -20 || true
 
     - name: Store *.deb files
@@ -424,19 +411,33 @@ jobs:
     steps:
     - uses: actions/checkout@v6
       with: { fetch-depth: 1 }
+
     - uses: actions/download-artifact@v6
       with: { path: ./all-artifacts }
 
+    # =================================================================
+    # FIXED: use `find` to locate debs-*.tar files, not a glob. The
+    # artifact layout may be flat (all-artifacts/debs-*.tar) OR nested
+    # (all-artifacts/debs-<name>/debs-*.tar). find covers both.
+    # =================================================================
     - name: Extract .deb files from tarballs
       run: |
         set -euo pipefail
         mkdir -p release-debs
-        shopt -s nullglob
 
         echo ">>> downloaded artifacts tree:"
-        find all-artifacts -maxdepth 3 -type f | head -30 || true
+        find all-artifacts -maxdepth 4 -type f | head -40 || true
 
-        for archive in all-artifacts/debs-*/debs-*.tar; do
+        mapfile -t ARCHIVES < <(find all-artifacts -type f -name 'debs-*.tar' 2>/dev/null || true)
+        echo ">>> found ${#ARCHIVES[@]} tar archive(s)"
+
+        if [ "${#ARCHIVES[@]}" -eq 0 ]; then
+          echo "::error::No debs-*.tar files under all-artifacts/"
+          find all-artifacts -maxdepth 4 -type f || true
+          exit 1
+        fi
+
+        for archive in "${ARCHIVES[@]}"; do
           echo ">>> extracting $archive"
           tar xf "$archive" -C release-debs
         done
@@ -444,10 +445,13 @@ jobs:
         count=$(find release-debs -type f -name '*.deb' | wc -l)
         echo ">>> found ${count} .deb files"
         if [ "$count" -eq 0 ]; then
-          echo "::warning::No .deb files found in artifacts — the build job produced nothing. Check the 'Build packages' step log."
-          # Do not fail; leave the release empty so the workflow completes.
-          exit 0
+          echo "::error::No .deb files found inside the extracted tars"
+          echo ">>> release-debs tree:"
+          find release-debs -maxdepth 3 -type f | head -30 || true
+          exit 1
         fi
+
+        find release-debs -type f -name '*.deb' | sort | head -20 || true
 
     - name: Upload .deb files
       run: |
@@ -455,10 +459,6 @@ jobs:
         TAG="${{ needs.prepare-release.outputs.tag }}"
         mapfile -t FILES < <(find release-debs -type f -name '*.deb' | sort)
         total="${#FILES[@]}"
-        if [ "$total" -eq 0 ]; then
-          echo ">>> nothing to upload"
-          exit 0
-        fi
         i=0
         failed=0
         for f in "${FILES[@]}"; do
@@ -490,3 +490,9 @@ jobs:
           exit 1
         fi
         echo ">>> all ${total} uploaded"
+
+    - name: Verify release assets
+      run: |
+        TAG="${{ needs.prepare-release.outputs.tag }}"
+        count=$(gh release view "$TAG" --json assets --jq '.assets | length')
+        echo ">>> release ${TAG} has ${count} assets"
