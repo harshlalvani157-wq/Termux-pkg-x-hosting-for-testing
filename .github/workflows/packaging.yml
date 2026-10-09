@@ -68,9 +68,6 @@ jobs:
     - name: Ensure work directories exist
       run: mkdir -p ./artifacts ./debs
 
-    # -----------------------------------------------------------------
-    # 1. Global rename: com.termux -> app.xodos2 (VHEditor style)
-    # -----------------------------------------------------------------
     - name: Rename com.termux -> app.xodos2 globally
       run: |
         set -euo pipefail
@@ -88,42 +85,33 @@ jobs:
         grep -rIn 'com\.termux' . \
           --exclude-dir=.git --exclude-dir=.github \
           --exclude-dir=debs --exclude-dir=artifacts \
-          | head -20 || echo "    (none)"
+          > /tmp/remaining.txt 2>/dev/null || true
+        head -20 /tmp/remaining.txt || echo "    (none)"
 
-    # -----------------------------------------------------------------
-    # 2. Patch apt: remove termux-keyring dep + rewrite sources.list
-    # -----------------------------------------------------------------
     - name: Patch apt package (custom repo + no keyring)
       run: |
         set -euo pipefail
         APT_BUILD="packages/apt/build.sh"
         [ -f "$APT_BUILD" ] || { echo "::error::$APT_BUILD not found"; exit 1; }
 
-        # remove termux-keyring from TERMUX_PKG_DEPENDS in every form
         sed -i 's/, termux-keyring//g' "$APT_BUILD"
         sed -i 's/termux-keyring, //g' "$APT_BUILD"
         sed -i 's/ termux-keyring//g'  "$APT_BUILD"
         sed -i 's/termux-keyring//g'   "$APT_BUILD"
 
-        # rewrite the sources.list lines
         sed -i 's|deb https://packages-cf\.termux\.dev/apt/termux-main/ stable main|deb [trusted=yes] https://xodiosx.github.io/Termux-pkg-x stable main|g' "$APT_BUILD"
         sed -i 's|deb https://packages-cf\.termux\.dev/apt/termux-main stable main|deb [trusted=yes] https://xodiosx.github.io/Termux-pkg-x stable main|g'  "$APT_BUILD"
         sed -i 's|deb https://packages\.termux\.dev/apt/termux-main/ stable main|# deb https://packages.termux.dev/apt/termux-main/ stable main|g'      "$APT_BUILD"
         sed -i 's|deb https://packages\.termux\.dev/apt/termux-main stable main|# deb https://packages.termux.dev/apt/termux-main/ stable main|g'        "$APT_BUILD"
 
         echo ">>> TERMUX_PKG_DEPENDS:"
-        grep -n 'TERMUX_PKG_DEPENDS=' "$APT_BUILD" | head -1
-        echo ">>> sources.list lines:"
-        grep -n 'xodiosx\|packages-cf.termux\|packages.termux' "$APT_BUILD" | head -10 || true
+        grep -n 'TERMUX_PKG_DEPENDS=' "$APT_BUILD" > /tmp/apt-dep.txt || true
+        head -1 /tmp/apt-dep.txt || true
 
-    # -----------------------------------------------------------------
-    # 3. Point build environment at our repo (no heredoc)
-    # -----------------------------------------------------------------
     - name: Override repository URL (~/.termuxrc + setup variables)
       run: |
         set -euo pipefail
 
-        # ---- ~/.termuxrc ----
         {
           echo 'TERMUX_REPO_PACKAGE="app.xodos2"'
           echo 'TERMUX_REPO_URL=('
@@ -136,10 +124,8 @@ jobs:
           echo '  main'
           echo ')'
         } > "$HOME/.termuxrc"
-        echo ">>> ~/.termuxrc:"
         cat "$HOME/.termuxrc"
 
-        # ---- scripts/build/termux_step_setup_variables.sh ----
         SETUP="scripts/build/termux_step_setup_variables.sh"
         if [ -f "$SETUP" ]; then
           awk '
@@ -160,7 +146,6 @@ jobs:
             { print }
           ' "$SETUP" > "$SETUP.new" && mv "$SETUP.new" "$SETUP"
 
-          echo ">>> setup variables after patch:"
           grep -nE '^TERMUX_REPO_(URL|DISTRIBUTION|COMPONENT)=' "$SETUP" || true
         fi
 
@@ -173,9 +158,10 @@ jobs:
           sed -i '/^termux_download_deb_pac() {/a\    # FORCED-BY-CI-FORCE-SOURCE-BUILD: return failure' "$TDP"
           sed -i '/FORCED-BY-CI-FORCE-SOURCE-BUILD: return failure/a\    return 1' "$TDP"
         fi
-        echo ">>> patched:"
-        grep -A3 'termux_download_deb_pac() {' "$TDP" | head -6
 
+    # =================================================================
+    # FIXED: use if/then instead of `[ COND ] && { ... }`.
+    # =================================================================
     - name: Gather build summary
       id: build-info
       env:
@@ -190,7 +176,7 @@ jobs:
           repo_paths=$(jq --raw-output 'del(.pkg_format) | keys | .[]' repo.json)
           declare -a resolved=()
           for pkg in "${PACKAGES[@]}"; do
-            [ -z "$pkg" ] && continue
+            if [ -z "$pkg" ]; then continue; fi
             for repo_path in $repo_paths; do
               repo=$(jq --raw-output '.["'${repo_path}'"].name' repo.json)
               if [ -d "${repo_path}/${pkg}" ]; then
@@ -198,12 +184,16 @@ jobs:
                 for subpkg in $(find "${repo_path}/${pkg}/" -maxdepth 1 -type f -name '*.subpackage.sh' | sort); do
                   echo "$(basename "${subpkg%%.subpackage.sh}")" >> "./built_${repo}_subpackages.txt"
                 done
-                resolved+=("$pkg"); break
+                resolved+=("$pkg")
+                break
               fi
             done
           done
           echo ">>> resolved ${#resolved[@]}: ${resolved[*]:-<none>}"
-          [ "${#resolved[@]}" -eq 0 ] && { echo "::error::None found."; exit 1; }
+          if [ "${#resolved[@]}" -eq 0 ]; then
+            echo "::error::None found."
+            exit 1
+          fi
         fi
 
     - name: Lint packages
@@ -214,7 +204,7 @@ jobs:
           repo=$(jq --raw-output '.["'${repo_path}'"].name' repo.json)
           if [ -f "./built_${repo}_packages.txt" ]; then
             while read -r p; do
-              [ -n "$p" ] && package_recipes+=("${repo_path}/${p}/build.sh")
+              if [ -n "$p" ]; then package_recipes+=("${repo_path}/${p}/build.sh"); fi
             done < "./built_${repo}_packages.txt"
           fi
         done
@@ -246,7 +236,7 @@ jobs:
           repo=$(jq --raw-output '.["'${repo_path}'"].name' repo.json)
           if [ -f "./built_${repo}_packages.txt" ]; then
             while read -r p; do
-              [ -n "$p" ] && packages+=("$p")
+              if [ -n "$p" ]; then packages+=("$p"); fi
             done < "./built_${repo}_packages.txt"
           fi
         done
@@ -254,7 +244,6 @@ jobs:
         echo ">>> packages: ${PKGS_STR}"
 
         if [ "${#packages[@]}" -gt 0 ]; then
-          # Write inner build script via echo (no heredoc)
           {
             echo 'set -e'
             echo 'PREFIX=/data/data/app.xodos2/files/usr'
@@ -265,7 +254,6 @@ jobs:
             echo "./build-package.sh -C -a aarch64 ${PKGS_STR}"
           } > /tmp/inner-build.sh
 
-          echo ">>> inner-build.sh:"
           cat /tmp/inner-build.sh
           ENCODED=$(base64 -w0 /tmp/inner-build.sh)
           ./scripts/run-docker.sh -d bash -c "echo '${ENCODED}' | base64 -d | bash" \
@@ -283,14 +271,16 @@ jobs:
         fi
 
         for repo in $(jq --raw-output 'del(.pkg_format) | .[].name' repo.json); do
-          [ -f "./built_${repo}_packages.txt" ] && mv "./built_${repo}_packages.txt" ./debs/ || true
+          if [ -f "./built_${repo}_packages.txt" ]; then
+            mv "./built_${repo}_packages.txt" ./debs/ || true
+          fi
           if [ -f "./built_${repo}_subpackages.txt" ]; then
             cat "./built_${repo}_subpackages.txt" >> "./debs/built_${repo}_packages.txt" 2>/dev/null || true
             rm -f "./built_${repo}_subpackages.txt"
           fi
           if [ -f "./debs/built_${repo}_packages.txt" ] && [ -d output ]; then
             while read -r pkg; do
-              [ -z "$pkg" ] && continue
+              if [ -z "$pkg" ]; then continue; fi
               find output \( -name "${pkg}_*.deb" -o -name "${pkg}-static_*.deb" \) -type f -print0 2>/dev/null \
                 | xargs -0r mv -t debs/ 2>/dev/null || true
             done < "./debs/built_${repo}_packages.txt"
@@ -343,21 +333,35 @@ jobs:
         TAG="${{ needs.prepare-release.outputs.tag }}"
         mapfile -t FILES < <(find release-debs -type f -name '*.deb' | sort)
         total="${#FILES[@]}"
-        i=0; failed=0
+        i=0
+        failed=0
         for f in "${FILES[@]}"; do
           i=$((i + 1))
           printf '[%d/%d] %s ... ' "$i" "$total" "$(basename "$f")"
           ok=0
           for attempt in 1 2 3 4 5; do
-            if gh release upload "$TAG" "$f" --clobber 2>/tmp/gh_err.log; then ok=1; break; fi
+            if gh release upload "$TAG" "$f" --clobber 2>/tmp/gh_err.log; then
+              ok=1
+              break
+            fi
             if grep -qiE 'secondary rate limit|abuse|rate limit' /tmp/gh_err.log; then
-              backoff=$((attempt * 15)); sleep "$backoff"
+              backoff=$((attempt * 15))
+              sleep "$backoff"
             else
-              backoff=$((attempt * 3)); sleep "$backoff"
+              backoff=$((attempt * 3))
+              sleep "$backoff"
             fi
           done
-          if [ "$ok" -eq 1 ]; then echo ok; else echo "FAILED: $(basename "$f")"; failed=$((failed + 1)); fi
+          if [ "$ok" -eq 1 ]; then
+            echo ok
+          else
+            echo "FAILED: $(basename "$f")"
+            failed=$((failed + 1))
+          fi
           sleep 1
         done
-        [ "$failed" -gt 0 ] && { echo "::error::${failed}/${total} failed"; exit 1; }
+        if [ "$failed" -gt 0 ]; then
+          echo "::error::${failed}/${total} failed"
+          exit 1
+        fi
         echo ">>> all ${total} uploaded"
