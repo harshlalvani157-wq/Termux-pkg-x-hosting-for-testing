@@ -1,4 +1,4 @@
-name: Generate bootstrap XoDos
+name: Generate bootstrap XoDos 
 
 on:
   schedule:
@@ -87,12 +87,9 @@ jobs:
             --repo "${{ github.repository }}" \
             --pattern "*.deb" \
             --dir ./all-debs
-          echo ">>> downloaded: $(find ./all-debs -name '*.deb' | wc -l) files"
+          n=$(find ./all-debs -name '*.deb' | wc -l)
+          echo ">>> downloaded: ${n} files"
 
-      # =================================================================
-      # Compute the dependency closure from the essential list, using
-      # each .deb's Depends field. This is what was missing.
-      # =================================================================
       - name: Resolve dependency closure
         env:
           ARCH: ${{ matrix.arch }}
@@ -105,7 +102,6 @@ jobs:
           ARCH = os.environ["ARCH"]
           deb_dir = "all-debs"
 
-          # Seed list — the packages you want at a minimum.
           essentials = [
               "apt", "bash", "bash-completion", "bzip2", "ca-certificates",
               "coreutils", "curl", "dash", "diffutils", "dpkg", "ed",
@@ -121,9 +117,6 @@ jobs:
               "unzip", "util-linux", "xz-utils", "zlib", "zstd",
           ]
 
-          # Also include anything providing a shared library.
-          # We'll add these seeds after scanning debs.
-
           def dpkg_field(path, field):
               try:
                   out = subprocess.check_output(
@@ -134,9 +127,8 @@ jobs:
               except subprocess.CalledProcessError:
                   return ""
 
-          # Scan every .deb, record name, arch, depends, provides
           pkg_info = {}
-          provides_map = defaultdict(list)   # provided name -> [real pkg names]
+          provides_map = defaultdict(list)
           for f in sorted(os.listdir(deb_dir)):
               if not f.endswith(".deb"):
                   continue
@@ -154,9 +146,7 @@ jobs:
                       part = part.strip()
                       if not part:
                           continue
-                      # take first alternative: "foo | bar"
                       first = part.split("|")[0].strip()
-                      # strip version constraint "(>= 1.0)"
                       first = first.split("(")[0].strip()
                       if first:
                           out.append(first)
@@ -174,16 +164,13 @@ jobs:
               for p in provides:
                   provides_map[p].append(name)
 
-          # Add as seeds every package whose name starts with "lib" that
-          # is compatible with this arch. Termux puts all shared libs in
-          # packages named lib*.
+          # Add every lib* package as a seed for this arch.
           for name, info in pkg_info.items():
               if name.startswith("lib"):
                   if info["arch"] == "all" or info["arch"] == ARCH:
                       if name not in essentials:
                           essentials.append(name)
 
-          # Resolve transitive closure
           needed = set()
           queue = []
           for e in essentials:
@@ -191,7 +178,6 @@ jobs:
                   needed.add(e)
                   queue.append(e)
               elif e in provides_map:
-                  # dep satisfied by a provides-alias; add all providers
                   for real in provides_map[e]:
                       if real not in needed:
                           needed.add(real)
@@ -213,7 +199,6 @@ jobs:
                           needed.add(t)
                           queue.append(t)
 
-          # Filter by arch: keep pkg if arch matches or is "all"
           keep = []
           skip_arch = []
           for name in sorted(needed):
@@ -228,7 +213,6 @@ jobs:
               print(f">>> skipped {len(skip_arch)} wrong-arch: {', '.join(skip_arch[:10])}"
                     + (" ..." if len(skip_arch) > 10 else ""))
 
-          # Check for missing deps that we couldn't resolve
           missing = []
           for name in keep:
               for dep in pkg_info[name]["depends"]:
@@ -239,7 +223,6 @@ jobs:
               for m in missing[:20]:
                   print(f"    {m}")
 
-          # Write selected package names to a file for the next step
           with open("selected-packages.txt", "w") as fh:
               for name in keep:
                   fh.write(name + "\n")
@@ -247,7 +230,6 @@ jobs:
           print(">>> sample:", ", ".join(keep[:20]))
           PYEOF
 
-          echo ">>> selected-packages.txt:"
           wc -l selected-packages.txt
 
       - name: Copy selected .deb files
@@ -261,7 +243,6 @@ jobs:
           kept=0
           while read -r pkg; do
             [ -z "$pkg" ] && continue
-            # Find the .deb whose control Package field equals $pkg
             found=""
             for deb in all-debs/*.deb; do
               name=$(dpkg-deb -f "$deb" Package 2>/dev/null || echo "")
@@ -282,7 +263,9 @@ jobs:
           done < selected-packages.txt
 
           echo ">>> copied ${kept} .deb files to debs/"
-          ls debs/ | head
+          # FIXED: write to file, then head (avoids SIGPIPE under pipefail)
+          ls debs/ > /tmp/debs-list.txt
+          head -20 /tmp/debs-list.txt || true
 
       - name: Extract into staging prefix
         run: |
@@ -311,12 +294,12 @@ jobs:
 
           echo ">>> staging top-level:"
           ls -la "$STAGING"
-          echo ">>> staging/lib sample:"
-          ls "$STAGING/lib/" 2>/dev/null | head -20 || true
 
-      # =================================================================
-      # Verify the specific libraries that were missing before.
-      # =================================================================
+          echo ">>> staging/lib sample:"
+          # FIXED: file then head
+          ls "$STAGING/lib/" > /tmp/lib-list.txt 2>/dev/null || true
+          head -20 /tmp/lib-list.txt || true
+
       - name: Verify key libraries are present
         run: |
           set -euo pipefail
