@@ -10,7 +10,7 @@ on:
         required: false
         default: ""
       arch:
-        description: "Comma-separated architectures, or 'all'"
+        description: "Comma-separated arch list, or 'all'"
         required: false
         default: "all"
 
@@ -43,7 +43,10 @@ jobs:
               --json tagName,createdAt \
               --jq '[.[] | select(.tagName | startswith("bootstrap-") | not)] | sort_by(.createdAt) | last | .tagName')"
           fi
-          [ -n "$TAG" ] && [ "$TAG" != "null" ] || { echo "::error::No suitable release found"; exit 1; }
+          if [ -z "$TAG" ] || [ "$TAG" = "null" ]; then
+            echo "::error::No suitable release found"
+            exit 1
+          fi
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo ">>> Using release tag: $TAG"
 
@@ -70,7 +73,7 @@ jobs:
       - name: Install tools
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq dpkg-dev
+          sudo apt-get install -y -qq dpkg-dev python3
 
       - name: Download .deb files from release
         env:
@@ -80,40 +83,206 @@ jobs:
           set -euo pipefail
           rm -rf ./all-debs
           mkdir -p ./all-debs
-          echo ">>> Downloading all .deb files from release ${RELEASE_TAG}"
           gh release download "$RELEASE_TAG" \
             --repo "${{ github.repository }}" \
             --pattern "*.deb" \
             --dir ./all-debs
           echo ">>> downloaded: $(find ./all-debs -name '*.deb' | wc -l) files"
 
-      - name: Filter to essential packages
+      # =================================================================
+      # Compute the dependency closure from the essential list, using
+      # each .deb's Depends field. This is what was missing.
+      # =================================================================
+      - name: Resolve dependency closure
         env:
           ARCH: ${{ matrix.arch }}
         run: |
           set -euo pipefail
+          python3 << 'PYEOF'
+          import subprocess, os, sys
+          from collections import defaultdict
 
-          # Essentials for a working Termux environment.
-          # termux-keyring is intentionally excluded — we disable signing.
-          ESSENTIALS="apt bash bash-completion bzip2 ca-certificates coreutils curl dash diffutils dpkg ed findutils gawk grep gzip inetutils less libandroid-support libbz2 libc++ libcap libcurl libexpat libgcrypt libgmp libgnutls libgpg-error libiconv liblzma libmd libmpfr libnettle libnghttp2 libnpth libsqlite libssh2 libunistring libxml2 lz4 ncurses ncurses-utils openssl openssl-tool patch procps psmisc readline resolv-conf sed tar termux-am termux-am-socket termux-core termux-exec termux-licenses termux-tools unzip util-linux xz-utils zlib zstd"
+          ARCH = os.environ["ARCH"]
+          deb_dir = "all-debs"
 
+          # Seed list — the packages you want at a minimum.
+          essentials = [
+              "apt", "bash", "bash-completion", "bzip2", "ca-certificates",
+              "coreutils", "curl", "dash", "diffutils", "dpkg", "ed",
+              "findutils", "gawk", "grep", "gzip", "inetutils", "less",
+              "libandroid-support", "libbz2", "libc++", "libcap", "libcurl",
+              "libexpat", "libgcrypt", "libgmp", "libgnutls", "libgpg-error",
+              "libiconv", "liblzma", "libmd", "libmpfr", "libnettle",
+              "libnghttp2", "libnpth", "libsqlite", "libssh2", "libunistring",
+              "libxml2", "lz4", "ncurses", "ncurses-utils", "openssl",
+              "openssl-tool", "patch", "procps", "psmisc", "readline",
+              "resolv-conf", "sed", "tar", "termux-am", "termux-am-socket",
+              "termux-core", "termux-exec", "termux-licenses", "termux-tools",
+              "unzip", "util-linux", "xz-utils", "zlib", "zstd",
+          ]
+
+          # Also include anything providing a shared library.
+          # We'll add these seeds after scanning debs.
+
+          def dpkg_field(path, field):
+              try:
+                  out = subprocess.check_output(
+                      ["dpkg-deb", "-f", path, field],
+                      stderr=subprocess.DEVNULL,
+                  ).decode().strip()
+                  return out
+              except subprocess.CalledProcessError:
+                  return ""
+
+          # Scan every .deb, record name, arch, depends, provides
+          pkg_info = {}
+          provides_map = defaultdict(list)   # provided name -> [real pkg names]
+          for f in sorted(os.listdir(deb_dir)):
+              if not f.endswith(".deb"):
+                  continue
+              path = os.path.join(deb_dir, f)
+              name = dpkg_field(path, "Package")
+              if not name:
+                  continue
+              arch = dpkg_field(path, "Architecture")
+              depends_raw = dpkg_field(path, "Depends") or dpkg_field(path, "Pre-Depends")
+              provides_raw = dpkg_field(path, "Provides")
+
+              def parse_list(raw):
+                  out = []
+                  for part in raw.split(","):
+                      part = part.strip()
+                      if not part:
+                          continue
+                      # take first alternative: "foo | bar"
+                      first = part.split("|")[0].strip()
+                      # strip version constraint "(>= 1.0)"
+                      first = first.split("(")[0].strip()
+                      if first:
+                          out.append(first)
+                  return out
+
+              deps = parse_list(depends_raw)
+              provides = parse_list(provides_raw)
+
+              pkg_info[name] = {
+                  "path": path,
+                  "arch": arch,
+                  "depends": deps,
+                  "provides": provides,
+              }
+              for p in provides:
+                  provides_map[p].append(name)
+
+          # Add as seeds every package whose name starts with "lib" that
+          # is compatible with this arch. Termux puts all shared libs in
+          # packages named lib*.
+          for name, info in pkg_info.items():
+              if name.startswith("lib"):
+                  if info["arch"] == "all" or info["arch"] == ARCH:
+                      if name not in essentials:
+                          essentials.append(name)
+
+          # Resolve transitive closure
+          needed = set()
+          queue = []
+          for e in essentials:
+              if e in pkg_info:
+                  needed.add(e)
+                  queue.append(e)
+              elif e in provides_map:
+                  # dep satisfied by a provides-alias; add all providers
+                  for real in provides_map[e]:
+                      if real not in needed:
+                          needed.add(real)
+                          queue.append(real)
+
+          while queue:
+              current = queue.pop()
+              info = pkg_info.get(current)
+              if not info:
+                  continue
+              for dep in info["depends"]:
+                  targets = []
+                  if dep in pkg_info:
+                      targets = [dep]
+                  elif dep in provides_map:
+                      targets = provides_map[dep]
+                  for t in targets:
+                      if t not in needed:
+                          needed.add(t)
+                          queue.append(t)
+
+          # Filter by arch: keep pkg if arch matches or is "all"
+          keep = []
+          skip_arch = []
+          for name in sorted(needed):
+              info = pkg_info[name]
+              if info["arch"] == "all" or info["arch"] == ARCH:
+                  keep.append(name)
+              else:
+                  skip_arch.append(f"{name}({info['arch']})")
+
+          print(f">>> keeping {len(keep)} packages for arch {ARCH}")
+          if skip_arch:
+              print(f">>> skipped {len(skip_arch)} wrong-arch: {', '.join(skip_arch[:10])}"
+                    + (" ..." if len(skip_arch) > 10 else ""))
+
+          # Check for missing deps that we couldn't resolve
+          missing = []
+          for name in keep:
+              for dep in pkg_info[name]["depends"]:
+                  if dep not in pkg_info and dep not in provides_map:
+                      missing.append(f"{name} -> {dep}")
+          if missing:
+              print(f">>> WARNING: unresolvable deps ({len(missing)}):")
+              for m in missing[:20]:
+                  print(f"    {m}")
+
+          # Write selected package names to a file for the next step
+          with open("selected-packages.txt", "w") as fh:
+              for name in keep:
+                  fh.write(name + "\n")
+
+          print(">>> sample:", ", ".join(keep[:20]))
+          PYEOF
+
+          echo ">>> selected-packages.txt:"
+          wc -l selected-packages.txt
+
+      - name: Copy selected .deb files
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
           mkdir -p debs
+          rm -f debs/*.deb 2>/dev/null || true
+
           kept=0
-          skipped=0
-          shopt -s nullglob
-          for deb in all-debs/*.deb; do
-            pkg=$(dpkg-deb -f "$deb" Package 2>/dev/null || echo "")
-            arch=$(dpkg-deb -f "$deb" Architecture 2>/dev/null || echo "")
-            [ -z "$pkg" ] && { skipped=$((skipped+1)); continue; }
-            [ "$arch" = "all" ] || [ "$arch" = "$ARCH" ] || { skipped=$((skipped+1)); continue; }
-            if printf '%s\n' $ESSENTIALS | grep -Fxq "$pkg"; then
-              cp "$deb" debs/
+          while read -r pkg; do
+            [ -z "$pkg" ] && continue
+            # Find the .deb whose control Package field equals $pkg
+            found=""
+            for deb in all-debs/*.deb; do
+              name=$(dpkg-deb -f "$deb" Package 2>/dev/null || echo "")
+              arch=$(dpkg-deb -f "$deb" Architecture 2>/dev/null || echo "")
+              if [ "$name" = "$pkg" ]; then
+                if [ "$arch" = "all" ] || [ "$arch" = "$ARCH" ]; then
+                  found="$deb"
+                  break
+                fi
+              fi
+            done
+            if [ -n "$found" ]; then
+              cp "$found" debs/
               kept=$((kept+1))
+            else
+              echo ">>> WARNING: no .deb found for '$pkg'"
             fi
-          done
-          shopt -u nullglob
-          echo ">>> kept=$kept skipped=$skipped"
-          ls -la debs/ | head
+          done < selected-packages.txt
+
+          echo ">>> copied ${kept} .deb files to debs/"
+          ls debs/ | head
 
       - name: Extract into staging prefix
         run: |
@@ -128,18 +297,13 @@ jobs:
             tmpdir=$(mktemp -d)
             dpkg-deb -x "$deb" "$tmpdir"
             prefix_dir="$tmpdir/data/data/app.xodos2/files/usr"
+            if [ ! -d "$prefix_dir" ]; then
+              prefix_dir="$tmpdir/data/data/com.termux/files/usr"
+            fi
             if [ -d "$prefix_dir" ]; then
               cp -a "$prefix_dir/." "$STAGING/"
             else
-              # Fallback: try com.termux (in case an older .deb slipped in)
-              prefix_dir="$tmpdir/data/data/com.termux/files/usr"
-              if [ -d "$prefix_dir" ]; then
-                echo ">>> NOTE: $pkg still uses com.termux paths; rewriting"
-                cp -a "$prefix_dir/." "$STAGING/"
-                grep -rl '/data/data/com.termux' "$STAGING" 2>/dev/null | while read -r f; do
-                  sed -i 's|/data/data/com\.termux|/data/data/app.xodos2|g' "$f"
-                done || true
-              fi
+              echo ">>> NOTE: $pkg has no recognisable prefix; skipping data"
             fi
             rm -rf "$tmpdir"
           done
@@ -147,6 +311,39 @@ jobs:
 
           echo ">>> staging top-level:"
           ls -la "$STAGING"
+          echo ">>> staging/lib sample:"
+          ls "$STAGING/lib/" 2>/dev/null | head -20 || true
+
+      # =================================================================
+      # Verify the specific libraries that were missing before.
+      # =================================================================
+      - name: Verify key libraries are present
+        run: |
+          set -euo pipefail
+          require=(
+            "lib/libandroid-selinux.so"
+            "lib/libandroid-glob.so"
+            "lib/libandroid-support.so"
+            "lib/libandroid-execinfo.so"
+            "lib/libandroid-shmem.so"
+            "lib/libandroid-spawn.so"
+            "lib/libandroid-utimes.so"
+            "lib/libandroid-posix-semaphore.so"
+          )
+          missing=0
+          for f in "${require[@]}"; do
+            if [ -e "staging/$f" ]; then
+              echo "  OK   $f"
+            else
+              echo "  MISS $f"
+              missing=$((missing+1))
+            fi
+          done
+          if [ "$missing" -gt 0 ]; then
+            echo "::warning::$missing key libraries are still missing"
+          else
+            echo ">>> all key libraries present"
+          fi
 
       - name: Write sources.list
         run: |
@@ -154,32 +351,27 @@ jobs:
           mkdir -p staging/etc/apt/sources.list.d
           rm -f staging/etc/apt/sources.list
           rm -f staging/etc/apt/sources.list.d/*.list 2>/dev/null || true
-          cat > staging/etc/apt/sources.list <<'EOF'
-          deb [trusted=yes] https://xodiosx.github.io/Termux-pkg-x stable main
-          EOF
-          echo ">>> sources.list:"
+          echo 'deb [trusted=yes] https://xodiosx.github.io/Termux-pkg-x stable main' \
+            > staging/etc/apt/sources.list
           cat staging/etc/apt/sources.list
 
       - name: Disable signature verification + strip keyring
         run: |
           set -euo pipefail
-          # Drop any keyring packages' files that might have slipped in
           rm -rf staging/etc/apt/trusted.gpg.d 2>/dev/null || true
           rm -rf staging/share/termux-keyring   2>/dev/null || true
           rm -rf staging/etc/termux-keyring     2>/dev/null || true
 
-          # Global "accept unsigned" config
           mkdir -p staging/etc/apt/apt.conf.d
-          cat > staging/etc/apt/apt.conf.d/99-insecure <<'EOF'
-          Acquire::AllowInsecureRepositories "true";
-          Acquire::AllowDowngradeToInsecureRepositories "true";
-          APT::Get::AllowUnauthenticated "true";
-          EOF
+          printf '%s\n' \
+            'Acquire::AllowInsecureRepositories "true";' \
+            'Acquire::AllowDowngradeToInsecureRepositories "true";' \
+            'APT::Get::AllowUnauthenticated "true";' \
+            > staging/etc/apt/apt.conf.d/99-insecure
 
-          echo ">>> apt.conf.d:"
           ls staging/etc/apt/apt.conf.d/
 
-      - name: Fix any lingering com.termux paths in scripts
+      - name: Fix lingering com.termux paths
         run: |
           set -euo pipefail
           mapfile -t files < <(grep -rl '/data/data/com\.termux' staging/ 2>/dev/null || true)
@@ -232,7 +424,7 @@ jobs:
           gh release create "$TAG" \
             --repo "${{ github.repository }}" \
             --title "Bootstrap archives $TAG" \
-            --notes "Prebuilt \`app.xodos2\` bootstrap archives (plain .tar.xz). Extract directly into \$PREFIX." \
+            --notes "Prebuilt app.xodos2 bootstrap archives (plain .tar.xz). Extract directly into \$PREFIX." \
             --target "${{ github.sha }}"
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
 
@@ -246,5 +438,4 @@ jobs:
             echo ">>> uploading $f"
             gh release upload "$TAG" "$f" --repo "${{ github.repository }}" --clobber
           done
-          echo ">>> release ${TAG} assets:"
           gh release view "$TAG" --repo "${{ github.repository }}" --json assets --jq '.assets[].name'
