@@ -4,11 +4,11 @@ on:
   workflow_dispatch:
     inputs:
       release_tag:
-        description: "Release tag to pull .deb files from (e.g. 2026.10.08-183521)"
+        description: "Release tag to pull .deb files from"
         required: true
         type: string
       keep_old:
-        description: "Keep valid .deb files already in docs/pool/ from previous runs (corrupt ones are always pruned)"
+        description: "Keep valid .deb files already in docs/pool/"
         type: boolean
         default: true
 
@@ -29,46 +29,23 @@ jobs:
         fetch-depth: 1
         ref: master
 
+    # =================================================================
+    # Protect .gz files from Git corruption.
+    # =================================================================
     - name: Ensure .gitattributes protects binary files
       run: |
         set -euo pipefail
         if [ ! -f .gitattributes ]; then
-          echo ">>> .gitattributes not found — creating it"
           cat > .gitattributes <<'EOF'
-        # Treat .deb files as binary — never convert line endings
         *.deb binary
         *.ddeb binary
-
-        # Other common binary formats
-        *.tar binary
         *.gz binary
         *.xz binary
         *.zst binary
-        *.zip binary
-        *.png binary
-        *.jpg binary
-        *.jpeg binary
-        *.gif binary
-        *.ico binary
-        *.so binary
-        *.a binary
-        *.o binary
-        *.woff binary
-        *.woff2 binary
-        *.ttf binary
-        *.otf binary
-        *.pdf binary
         EOF
         else
-          if ! grep -q '^\s*\*\.deb binary' .gitattributes; then
-            echo ">>> adding '*.deb binary' to existing .gitattributes"
-            printf '\n# Treat .deb files as binary\n*.deb binary\n' >> .gitattributes
-          fi
-          if ! grep -q '^\s*\*\.ddeb binary' .gitattributes; then
-            printf '*.ddeb binary\n' >> .gitattributes
-          fi
+          grep -q '^\s*\*\.gz binary' .gitattributes || echo '*.gz binary' >> .gitattributes
         fi
-        echo ">>> .gitattributes contents:"
         cat .gitattributes
 
     - name: Install tools
@@ -79,31 +56,21 @@ jobs:
     - name: Optionally wipe existing pool
       if: ${{ inputs.keep_old != 'true' }}
       run: |
-        set -euo pipefail
-        echo ">>> keep_old=false — wiping docs/pool and docs/dists"
         rm -rf ./docs/pool ./docs/dists
 
     - name: Prune corrupt .deb files in docs/pool
       run: |
         set -euo pipefail
-        if [ ! -d ./docs/pool ]; then
-          echo ">>> docs/pool does not exist — nothing to prune"
-          exit 0
-        fi
-
+        if [ ! -d ./docs/pool ]; then exit 0; fi
         removed=0
-        kept=0
         while IFS= read -r -d '' deb; do
-          if dpkg-deb -I "$deb" >/dev/null 2>&1; then
-            kept=$((kept + 1))
-          else
+          if ! dpkg-deb -I "$deb" >/dev/null 2>&1; then
             echo ">>> PRUNING corrupt .deb: $deb"
             rm -f "$deb"
             removed=$((removed + 1))
           fi
         done < <(find ./docs/pool -type f -name '*.deb' -print0)
-
-        echo ">>> pruned ${removed} corrupt .deb file(s); kept ${kept} valid"
+        echo ">>> pruned ${removed} corrupt .deb file(s)"
         find ./docs/pool -mindepth 1 -type d -empty -delete 2>/dev/null || true
 
     - name: Download .deb files from release
@@ -114,50 +81,39 @@ jobs:
         set -euo pipefail
         rm -rf ./debs-from-release
         mkdir -p ./debs-from-release
-        echo ">>> Downloading .deb files from release: ${RELEASE_TAG}"
         gh release download "$RELEASE_TAG" \
           --repo "${{ github.repository }}" \
           --pattern "*.deb" \
           --dir ./debs-from-release || true
-
         count=$(find ./debs-from-release -type f -name '*.deb' | wc -l)
         echo ">>> Downloaded ${count} .deb file(s)"
-        if [ "$count" -eq 0 ]; then
-          echo "::warning::Release ${RELEASE_TAG} has no .deb assets — nothing new to add"
-        fi
 
     - name: Validate and place downloaded .deb files into pool
       run: |
         set -euo pipefail
         POOL_ROOT="./docs/pool/main"
         mkdir -p "$POOL_ROOT"
-
-        valid=0
-        invalid=0
         shopt -s nullglob
         for deb in ./debs-from-release/*.deb; do
           if ! dpkg-deb -I "$deb" >/dev/null 2>&1; then
             echo ">>> SKIPPING invalid .deb: $(basename "$deb")"
-            invalid=$((invalid + 1))
             continue
           fi
-
           pkg_name=$(dpkg-deb -f "$deb" Package)
           pkg_arch=$(dpkg-deb -f "$deb" Architecture)
           first_letter=$(printf '%s' "$pkg_name" | cut -c1 | tr 'A-Z' 'a-z')
           dest_dir="$POOL_ROOT/$first_letter/$pkg_name"
           mkdir -p "$dest_dir"
           cp -a "$deb" "$dest_dir/"
-          echo ">>> placed: $pkg_name [$pkg_arch] -> $dest_dir"
-          valid=$((valid + 1))
+          echo ">>> placed: $pkg_name [$pkg_arch]"
         done
         shopt -u nullglob
 
-        echo ""
-        echo ">>> valid=${valid} invalid=${invalid}"
-        echo ">>> total .deb in pool: $(find ./docs/pool -type f -name '*.deb' | wc -l)"
-
-    - name: Generate Packages indexes with dpkg-scanpackages
+    # =================================================================
+    # Generate ONLY Packages and Packages.gz. No .xz.
+    # GitHub Pages corrupts pre-compressed .xz files during transfer.
+    # =================================================================
+    - name: Generate Packages indexes (gzip only)
       run: |
         set -euo pipefail
         DIST="dists/stable"
@@ -179,29 +135,20 @@ jobs:
         dpkg-scanpackages --multiversion --arch all pool/main /tmp/override.empty \
           > "$DIST/$COMP/binary-all/Packages"
 
-        echo ""
-        echo ">>> aarch64 Packages entry count:"
-        grep -c '^Package:' "$DIST/$COMP/binary-aarch64/Packages" || true
-        echo ">>> binary-all Packages entry count:"
-        grep -c '^Package:' "$DIST/$COMP/binary-all/Packages" || true
-
-        echo ""
-        echo ">>> Sample Filename fields:"
-        grep '^Filename:' "$DIST/$COMP/binary-aarch64/Packages" > /tmp/filenames.txt || true
-        head -10 /tmp/filenames.txt || true
-
-    - name: Compress Packages indexes
-      run: |
-        set -euo pipefail
-        cd ./docs
+        echo ">>> Compressing with gzip only (no xz)"
         for arch in aarch64 all; do
-          f="dists/stable/main/binary-$arch/Packages"
+          f="$DIST/$COMP/binary-$arch/Packages"
           gzip -kf -9 "$f"
-          xz -kf -9 "$f"
+          # Explicitly ensure no .xz is created
+          rm -f "$f.xz"
         done
-        echo ">>> index files:"
-        find dists/stable/main -maxdepth 2 -type f | sort
 
+        echo ">>> index files:"
+        find "$DIST/$COMP" -type f | sort
+
+    # =================================================================
+    # Generate Release file. Must reference ONLY .gz (not .xz).
+    # =================================================================
     - name: Generate Release file with apt-ftparchive
       run: |
         set -euo pipefail
@@ -220,17 +167,28 @@ jobs:
           release dists/stable > dists/stable/Release
         cp dists/stable/Release dists/stable/InRelease
 
-        echo ">>> Release file (first 40 lines):"
-        head -40 dists/stable/Release
+        echo ">>> Release file:"
+        cat dists/stable/Release
 
+    # =================================================================
+    # Verify that only .gz is referenced, and Filename paths are correct.
+    # =================================================================
     - name: Verify repo layout
       run: |
         set -euo pipefail
-        echo ">>> docs/ top level:"
-        ls -la docs/
+        echo ">>> Checking Release file references:"
+        grep -E '^( [a-f0-9]{32,} [0-9]+ .*Packages\.)' docs/dists/stable/Release || true
 
         echo ""
-        echo ">>> Packages Filename sanity (must start with 'pool/'):"
+        echo ">>> Checking for .xz references (should be none):"
+        if grep -q 'Packages.xz' docs/dists/stable/Release; then
+          echo "::error::Release file still references Packages.xz"
+          exit 1
+        fi
+        echo "  No .xz references — OK"
+
+        echo ""
+        echo ">>> Packages Filename sanity:"
         bad=0
         while IFS= read -r line; do
           case "$line" in
@@ -238,10 +196,7 @@ jobs:
             Filename:\ *) echo "  BAD: $line"; bad=$((bad+1)) ;;
           esac
         done < <(grep '^Filename:' docs/dists/stable/main/binary-aarch64/Packages || true)
-        if [ "$bad" -gt 0 ]; then
-          echo "::error::$bad Filename entries are not under pool/"
-          exit 1
-        fi
+        [ "$bad" -gt 0 ] && { echo "::error::$bad bad Filename entries"; exit 1; }
         echo "  All Filename entries start with 'pool/' — OK"
 
         echo ""
@@ -263,16 +218,9 @@ jobs:
     - name: Summary
       run: |
         {
-          echo "## APT Repository Generated"
+          echo "## APT Repository Generated (gzip only)"
           echo ""
           echo "- **Release:** \`${{ inputs.release_tag }}\`"
-          echo "- **keep_old:** \`${{ inputs.keep_old }}\`"
           echo "- **Repo URL:** https://xodiosx.github.io/Termux-pkg-x"
-          echo "- **Packages index:** https://xodiosx.github.io/Termux-pkg-x/dists/stable/main/binary-aarch64/Packages"
-          echo "- **Release file:** https://xodiosx.github.io/Termux-pkg-x/dists/stable/Release"
-          echo ""
-          echo "### Verify"
-          echo '```'
-          echo "curl -sL https://xodiosx.github.io/Termux-pkg-x/dists/stable/main/binary-aarch64/Packages | grep '^Filename:' | head"
-          echo '```'
+          echo "- **Packages index:** https://xodiosx.github.io/Termux-pkg-x/dists/stable/main/binary-aarch64/Packages.gz"
         } >> $GITHUB_STEP_SUMMARY
