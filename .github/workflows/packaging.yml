@@ -100,6 +100,54 @@ jobs:
 
         grep -nE '^TERMUX_APP__PACKAGE_NAME=' scripts/properties.sh || true
 
+    # =================================================================
+    # Patch termux-tools: custom mirror list + disable mirror testing
+    # + add [trusted=yes] to generated sources.list
+    # =================================================================
+    - name: Patch termux-tools for custom repo
+      run: |
+        set -euo pipefail
+        TOOLS_BUILD="packages/termux-tools/build.sh"
+        [ -f "$TOOLS_BUILD" ] || { echo "::error::$TOOLS_BUILD not found"; exit 1; }
+
+        # Append a new termux_step_post_make_install that overwrites the
+        # mirrors and patches the installed pkg script.
+        # (The later definition wins in bash.)
+        cat >> "$TOOLS_BUILD" <<'TOOLSEOF'
+
+termux_step_post_make_install() {
+	TERMUX_PKG_CONFFILES="$(cat "$TERMUX_PKG_BUILDDIR/conffiles")"
+
+	# --- Custom mirror: only our repo ---
+	MIRROR_DIR="$TERMUX_PREFIX/etc/termux/mirrors"
+	mkdir -p "$MIRROR_DIR"
+
+	cat > "$MIRROR_DIR/default" <<'MIRROREOF'
+# This file is sourced by pkg
+WEIGHT=10
+MAIN="https://xodiosx.github.io/Termux-pkg-x"
+MIRROREOF
+
+	# Remove every other mirror file
+	find "$MIRROR_DIR" -mindepth 1 -type f ! -name 'default' -delete 2>/dev/null || true
+	find "$MIRROR_DIR" -mindepth 1 -type d -empty -delete 2>/dev/null || true
+
+	# --- Patch the installed pkg script ---
+	PKG="$TERMUX_PREFIX/bin/pkg"
+	if [ -f "$PKG" ]; then
+		# 1. Force skip mirror testing (no network round-trips)
+		sed -i 's|^MIRROR_BASE_DIR=.*|&\nTERMUX_PKG_NO_MIRROR_SELECT=1|' "$PKG"
+
+		# 2. Add [trusted=yes] to the URIs written to sources.list
+		sed -i 's|"URIs: \$MAIN"|"URIs: [trusted=yes] \$MAIN"|g' "$PKG"
+		sed -i 's|"deb \$MAIN|"deb [trusted=yes] \$MAIN|g' "$PKG"
+	fi
+}
+TOOLSEOF
+
+        echo ">>> patched $TOOLS_BUILD"
+        tail -40 "$TOOLS_BUILD"
+
     - name: Patch apt package (custom repo + no keyring)
       run: |
         set -euo pipefail
@@ -161,10 +209,6 @@ jobs:
           sed -i '/FORCED-BY-CI-FORCE-SOURCE-BUILD: return failure/a\    return 1' "$TDP"
         fi
 
-    # =================================================================
-    # Skip known-broken packages by editing them out of the summary file
-    # after it's produced. We still want to see them reported as skipped.
-    # =================================================================
     - name: Gather build summary
       id: build-info
       env:
@@ -181,8 +225,6 @@ jobs:
           declare -a skipped_broken=()
           for pkg in "${PACKAGES[@]}"; do
             if [ -z "$pkg" ]; then continue; fi
-
-            # --- Known-broken list: skip and report ---
             case "$pkg" in
               vkmark)
                 echo "::warning::Skipping '$pkg' — upstream Vulkan-Hpp 1.4.365 removed isDispatchLoader; package patch 0003 is stale."
@@ -190,8 +232,6 @@ jobs:
                 continue
                 ;;
             esac
-            # ------------------------------------------
-
             for repo_path in $repo_paths; do
               repo=$(jq --raw-output '.["'${repo_path}'"].name' repo.json)
               if [ -d "${repo_path}/${pkg}" ]; then
@@ -244,10 +284,6 @@ jobs:
       if: ${{ steps.build-info.outputs.free-space == 'true' }}
       run: ./scripts/free-space.sh
 
-    # =================================================================
-    # Build each package in its own invocation so a single failure
-    # doesn't stop the rest of the queue.
-    # =================================================================
     - name: Build packages
       run: |
         set -euo pipefail
@@ -268,7 +304,6 @@ jobs:
           exit 0
         fi
 
-        # Write an inner script that loops over packages and continues on failure.
         {
           echo 'set -uo pipefail'
           echo 'PREFIX=/data/data/app.xodos2/files/usr'
@@ -302,9 +337,6 @@ jobs:
         echo ">>> ---"
 
         ENCODED=$(base64 -w0 /tmp/inner-build.sh)
-
-        # Don't fail the workflow on partial failures — we handle that
-        # in a separate verification step below so all packages still try.
         ./scripts/run-docker.sh -d bash -c "echo '${ENCODED}' | base64 -d | bash" || true
 
     - name: Generate build artifacts
@@ -338,9 +370,6 @@ jobs:
         echo ">>> debs/ contains: ${n} .deb files"
         tar cf "artifacts/debs-${{ matrix.target_arch }}-${{ github.sha }}.tar" debs
 
-    # =================================================================
-    # Fail loudly if any *requested* package produced no .deb.
-    # =================================================================
     - name: Verify requested packages were built
       if: always()
       run: |
