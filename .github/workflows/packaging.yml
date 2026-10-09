@@ -104,13 +104,12 @@ jobs:
         grep -nE '^TERMUX_APP__PACKAGE_NAME=' scripts/properties.sh || true
 
     # =================================================================
-    # Patch termux-tools: ship a custom mirror file, disable mirror
-    # selection, add [trusted=yes]. FIXED to use TAB indentation, as
-    # required by the Termux lint-packages.sh.
-    #
-    # YAML forbids literal tabs in run: | blocks, so we write the patch
-    # with 2-space indents into a temp file, then convert 2 spaces -> 1
-    # tab with awk before appending to build.sh.
+    # Patch termux-tools: overwrite default mirror + force MIRROR_GROUP=default
+    # and add [trusted=yes]. Do NOT delete the shipped subgroup mirror files,
+    # because pkg's mirror_is_set() check requires at least one to exist and
+    # termux-change-repo iterates each subgroup directory with find.
+    # All indentation is tabs (Termux lint-packages.sh requirement), so
+    # we write the patch with spaces then convert spaces -> tabs.
     # =================================================================
     - name: Patch termux-tools for custom repo (tab-indented)
       run: |
@@ -125,23 +124,26 @@ jobs:
 
           MIRROR_DIR="$TERMUX_PREFIX/etc/termux/mirrors"
           mkdir -p "$MIRROR_DIR"
-          D="$MIRROR_DIR/default"
-          {
-            echo "# This file is sourced by pkg"
-            echo "WEIGHT=10"
-            echo 'MAIN="https://xodiosx.github.io/Termux-pkg-x"'
-          } > "$D"
-          find "$MIRROR_DIR" -mindepth 1 -type f ! -name default -delete 2>/dev/null || true
-          find "$MIRROR_DIR" -mindepth 1 -type d -empty -delete 2>/dev/null || true
+          cat > "$MIRROR_DIR/default" <<'MIRROREOF'
+        # This file is sourced by pkg
+        WEIGHT=10
+        MAIN="https://xodiosx.github.io/Termux-pkg-x"
+        MIRROREOF
+
           PKG="$TERMUX_PREFIX/bin/pkg"
           if [ -f "$PKG" ]; then
-            grep -q TERMUX_PKG_NO_MIRROR_SELECT "$PKG" || echo "TERMUX_PKG_NO_MIRROR_SELECT=1" >> "$PKG"
-            sed -i 's|deb $MAIN|deb [trusted=yes] $MAIN|g' "$PKG" || true
+            if ! grep -q 'FORCED_BY_XODIOSX' "$PKG"; then
+              sed -i '1a\
+        # FORCED_BY_XODIOSX: force our default mirror\
+        MIRROR_GROUP="default"\
+        export MIRROR_GROUP' "$PKG" 2>/dev/null || true
+            fi
+            sed -i 's|deb \$MAIN|deb [trusted=yes] \$MAIN|g' "$PKG" || true
+            sed -i 's|"URIs: \$MAIN"|"URIs: [trusted=yes] \$MAIN"|g' "$PKG" || true
           fi
         }
         RAWEOF
 
-        # Convert 2 leading spaces -> 1 tab, 4 -> 2 tabs, etc.
         awk '
           {
             if (match($0, /^ +/)) {
@@ -157,14 +159,13 @@ jobs:
         ' "$RAW" > "$RAW.tab"
         mv "$RAW.tab" "$RAW"
 
-        # Make sure build.sh ends with a newline before appending.
         echo "" >> "$TOOLS_BUILD"
         cat "$RAW" >> "$TOOLS_BUILD"
 
-        echo ">>> appended patch (tabs show as ^I):"
+        echo ">>> appended patch (^I = tab):"
         cat -A "$RAW"
         echo ""
-        echo ">>> tail of build.sh (tabs show as ^I):"
+        echo ">>> tail of build.sh (^I = tab):"
         tail -25 "$TOOLS_BUILD" | cat -A
 
     - name: Patch apt package (custom repo + no keyring)
@@ -230,26 +231,12 @@ jobs:
 
         if [ "$USE_REPO_DEPS" = "true" ]; then
           echo ">>> Fetching dependencies from https://xodiosx.github.io/Termux-pkg-x"
-          echo ">>> Leaving termux_download_deb_pac.sh untouched"
-          {
-            echo 'TERMUX_REPO_PACKAGE="app.xodos2"'
-            echo 'TERMUX_REPO_URL=('
-            echo '  https://xodiosx.github.io/Termux-pkg-x'
-            echo ')'
-            echo 'TERMUX_REPO_DISTRIBUTION=('
-            echo '  stable'
-            echo ')'
-            echo 'TERMUX_REPO_COMPONENT=('
-            echo '  main'
-            echo ')'
-          } > "$HOME/.termuxrc"
         else
           echo ">>> Forcing source builds of all dependencies"
           if ! grep -q 'FORCED-BY-CI-FORCE-SOURCE-BUILD' "$TDP"; then
             sed -i '/^termux_download_deb_pac() {/a\    # FORCED-BY-CI-FORCE-SOURCE-BUILD: return failure' "$TDP"
             sed -i '/FORCED-BY-CI-FORCE-SOURCE-BUILD: return failure/a\    return 1' "$TDP"
           fi
-          grep -A3 'termux_download_deb_pac() {' "$TDP" | head -6 || true
         fi
 
     - name: Gather build summary
