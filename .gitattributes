@@ -27,3 +27,4 @@
 # Treat .deb files as binary
 *.deb binary
 *.ddeb binary
+*.gz binary
