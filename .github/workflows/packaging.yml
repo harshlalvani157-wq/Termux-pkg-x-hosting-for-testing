@@ -68,6 +68,47 @@ jobs:
     - name: Ensure work directories exist
       run: mkdir -p ./artifacts ./debs
 
+    # =================================================================
+    # Drop root-packages duplicates (v4l-utils and anything else that
+    # also exists in packages/). Then delete root-packages from repo.json
+    # so buildorder.py never scans it.
+    # =================================================================
+    - name: Drop duplicate root-packages
+      run: |
+        set -euo pipefail
+
+        # 1. Remove every root-package whose name also exists in packages/
+        if [ -d root-packages ]; then
+          for d in root-packages/*/; do
+            [ -d "$d" ] || continue
+            p=$(basename "$d")
+            if [ -d "packages/$p" ]; then
+              echo ">>> removing root-packages/$p (also in packages/)"
+              rm -rf "root-packages/$p"
+            fi
+          done
+        fi
+
+        # 2. Remove root-packages from repo.json
+        if jq -e 'has("root-packages")' repo.json >/dev/null 2>&1; then
+          jq 'del(.["root-packages"])' repo.json > repo.json.tmp
+          mv repo.json.tmp repo.json
+          echo ">>> removed root-packages from repo.json"
+        fi
+
+        echo ">>> remaining repo.json keys:"
+        jq -r 'keys[]' repo.json
+
+        echo ">>> any leftover root-packages dirs:"
+        if [ -d root-packages ]; then
+          ls -la root-packages/ || true
+        else
+          echo "    (root-packages removed)"
+        fi
+
+    # =================================================================
+    # Global rename: com.termux -> app.xodos2
+    # =================================================================
     - name: Rename com.termux -> app.xodos2 globally
       run: |
         set -euo pipefail
@@ -88,6 +129,9 @@ jobs:
           > /tmp/remaining.txt 2>/dev/null || true
         head -20 /tmp/remaining.txt || echo "    (none)"
 
+    # =================================================================
+    # Patch apt package (custom repo + no keyring)
+    # =================================================================
     - name: Patch apt package (custom repo + no keyring)
       run: |
         set -euo pipefail
@@ -108,6 +152,9 @@ jobs:
         grep -n 'TERMUX_PKG_DEPENDS=' "$APT_BUILD" > /tmp/apt-dep.txt || true
         head -1 /tmp/apt-dep.txt || true
 
+    # =================================================================
+    # Override repository URL
+    # =================================================================
     - name: Override repository URL (~/.termuxrc + setup variables)
       run: |
         set -euo pipefail
@@ -159,9 +206,6 @@ jobs:
           sed -i '/FORCED-BY-CI-FORCE-SOURCE-BUILD: return failure/a\    return 1' "$TDP"
         fi
 
-    # =================================================================
-    # FIXED: use if/then instead of `[ COND ] && { ... }`.
-    # =================================================================
     - name: Gather build summary
       id: build-info
       env:
