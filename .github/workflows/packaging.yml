@@ -11,7 +11,12 @@ on:
       packages:
         description: "Space-separated package names to build"
         required: false
+      deps-from-repo:
+        description: "Install dependencies from custom repo (skip source builds)"
+        type: boolean
+        default: false
       free-space:
+        description: "Free disk space"
         type: boolean
         default: false
 
@@ -66,7 +71,7 @@ jobs:
       with: { fetch-depth: 1000 }
 
     - name: Ensure work directories exist
-      run: mkdir -p ./artifacts ./debs
+      run: mkdir -p ./artifacts ./debs ./debs-deps
 
     - name: Drop duplicate root-packages
       run: |
@@ -94,6 +99,7 @@ jobs:
           -path ./.git -prune -false -o \
           -path ./.github -prune -false -o \
           -path ./debs -prune -false -o \
+          -path ./debs-deps -prune -false -o \
           -path ./artifacts -prune -false -o \
           -type f -print0 | \
         xargs -0 -r -n50 sed -i 's/com\.termux/app.xodos2/g'
@@ -101,8 +107,7 @@ jobs:
         grep -nE '^TERMUX_APP__PACKAGE_NAME=' scripts/properties.sh || true
 
     # =================================================================
-    # Patch termux-tools: custom mirror list + disable mirror testing
-    # + add [trusted=yes] to generated sources.list
+    # Patch termux-tools: custom mirror list + no keyring
     # =================================================================
     - name: Patch termux-tools for custom repo
       run: |
@@ -110,42 +115,41 @@ jobs:
         TOOLS_BUILD="packages/termux-tools/build.sh"
         [ -f "$TOOLS_BUILD" ] || { echo "::error::$TOOLS_BUILD not found"; exit 1; }
 
-        # Append a new termux_step_post_make_install that overwrites the
-        # mirrors and patches the installed pkg script.
-        # (The later definition wins in bash.)
         cat >> "$TOOLS_BUILD" <<'TOOLSEOF'
 
-termux_step_post_make_install() {
-	TERMUX_PKG_CONFFILES="$(cat "$TERMUX_PKG_BUILDDIR/conffiles")"
+        termux_step_post_make_install() {
+            TERMUX_PKG_CONFFILES="$(cat "$TERMUX_PKG_BUILDDIR/conffiles")"
 
-	# --- Custom mirror: only our repo ---
-	MIRROR_DIR="$TERMUX_PREFIX/etc/termux/mirrors"
-	mkdir -p "$MIRROR_DIR"
+            # --- Custom mirror: only our repo ---
+            MIRROR_DIR="$TERMUX_PREFIX/etc/termux/mirrors"
+            mkdir -p "$MIRROR_DIR"
 
-	cat > "$MIRROR_DIR/default" <<'MIRROREOF'
-# This file is sourced by pkg
-WEIGHT=10
-MAIN="https://xodiosx.github.io/Termux-pkg-x"
-MIRROREOF
+            cat > "$MIRROR_DIR/default" <<"MIRROREOF"
+        # This file is sourced by pkg
+        WEIGHT=10
+        MAIN="https://xodiosx.github.io/Termux-pkg-x"
+        MIRROREOF
 
-	# Remove every other mirror file
-	find "$MIRROR_DIR" -mindepth 1 -type f ! -name 'default' -delete 2>/dev/null || true
-	find "$MIRROR_DIR" -mindepth 1 -type d -empty -delete 2>/dev/null || true
+            find "$MIRROR_DIR" -mindepth 1 -type f ! -name default -delete 2>/dev/null || true
+            find "$MIRROR_DIR" -mindepth 1 -type d -empty -delete 2>/dev/null || true
 
-	# --- Patch the installed pkg script ---
-	PKG="$TERMUX_PREFIX/bin/pkg"
-	if [ -f "$PKG" ]; then
-		# 1. Force skip mirror testing (no network round-trips)
-		sed -i 's|^MIRROR_BASE_DIR=.*|&\nTERMUX_PKG_NO_MIRROR_SELECT=1|' "$PKG"
+            # --- Pre-create sources.list with trusted=yes ---
+            mkdir -p "$TERMUX_PREFIX/etc/apt/sources.list.d"
+            echo "deb [trusted=yes] https://xodiosx.github.io/Termux-pkg-x stable main" \
+                > "$TERMUX_PREFIX/etc/apt/sources.list"
 
-		# 2. Add [trusted=yes] to the URIs written to sources.list
-		sed -i 's|"URIs: \$MAIN"|"URIs: [trusted=yes] \$MAIN"|g' "$PKG"
-		sed -i 's|"deb \$MAIN|"deb [trusted=yes] \$MAIN|g' "$PKG"
-	fi
-}
-TOOLSEOF
+            # --- Patch pkg script to add [trusted=yes] on future regenerations ---
+            PKG="$TERMUX_PREFIX/bin/pkg"
+            if [ -f "$PKG" ]; then
+                sed -i -e 's|deb \$MAIN|deb [trusted=yes] $MAIN|g' "$PKG"
+                sed -i -e 's|deb \${MAIN}|deb [trusted=yes] ${MAIN}|g' "$PKG"
+                sed -i -e 's|deb \$ROOT|deb [trusted=yes] $ROOT|g' "$PKG"
+                sed -i -e 's|deb \$X11|deb [trusted=yes] $X11|g' "$PKG"
+            fi
+        }
+        TOOLSEOF
 
-        echo ">>> patched $TOOLS_BUILD"
+        echo ">>> patched termux-tools build.sh"
         tail -40 "$TOOLS_BUILD"
 
     - name: Patch apt package (custom repo + no keyring)
@@ -199,7 +203,11 @@ TOOLSEOF
           ' "$SETUP" > "$SETUP.new" && mv "$SETUP.new" "$SETUP"
         fi
 
-    - name: Patch termux_download_deb_pac.sh
+    # =================================================================
+    # Force source builds ONLY when deps-from-repo is disabled.
+    # =================================================================
+    - name: Patch termux_download_deb_pac.sh (force source builds)
+      if: ${{ !inputs.deps-from-repo }}
       run: |
         set -euo pipefail
         TDP="scripts/build/termux_download_deb_pac.sh"
@@ -208,6 +216,31 @@ TOOLSEOF
           sed -i '/^termux_download_deb_pac() {/a\    # FORCED-BY-CI-FORCE-SOURCE-BUILD: return failure' "$TDP"
           sed -i '/FORCED-BY-CI-FORCE-SOURCE-BUILD: return failure/a\    return 1' "$TDP"
         fi
+
+    # =================================================================
+    # Download pre-built deps if checkbox is enabled
+    # =================================================================
+    - name: Download dependencies from latest release
+      if: ${{ inputs.deps-from-repo }}
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        set -euo pipefail
+        mkdir -p debs-deps
+        TAG="$(gh release list --repo "${{ github.repository }}" --limit 100 \
+          --json tagName,createdAt \
+          --jq '[.[] | select(.tagName | startswith("bootstrap-") | not)] | sort_by(.createdAt) | last | .tagName')"
+        if [ -z "$TAG" ] || [ "$TAG" = "null" ]; then
+          echo "::warning::No release found — nothing to download"
+          exit 0
+        fi
+        echo ">>> Downloading deps from release: $TAG"
+        gh release download "$TAG" \
+          --repo "${{ github.repository }}" \
+          --pattern "*.deb" \
+          --dir debs-deps || true
+        n=$(find debs-deps -name '*.deb' | wc -l)
+        echo ">>> Downloaded ${n} .deb files into debs-deps/"
 
     - name: Gather build summary
       id: build-info
@@ -304,12 +337,26 @@ TOOLSEOF
           exit 0
         fi
 
+        USE_DEPS_FROM_REPO="${{ inputs.deps-from-repo }}"
+        echo ">>> deps-from-repo: ${USE_DEPS_FROM_REPO}"
+
         {
           echo 'set -uo pipefail'
           echo 'PREFIX=/data/data/app.xodos2/files/usr'
           echo 'BUILD_ROOT=/home/builder/termux-packages'
           echo 'mkdir -p "$PREFIX/var/lib/dpkg/info"'
           echo 'cd "$BUILD_ROOT"'
+          echo ''
+          echo 'DEPS_DIR="$BUILD_ROOT/debs-deps"'
+          echo "USE_DEPS='${USE_DEPS_FROM_REPO}'"
+          echo 'if [ "$USE_DEPS" = "true" ] && [ -d "$DEPS_DIR" ]; then'
+          echo '  n=$(find "$DEPS_DIR" -name "*.deb" | wc -l)'
+          echo '  echo ">>> Installing ${n} pre-built dependencies from ${DEPS_DIR}"'
+          echo '  export DPKG_ADMINDIR="$PREFIX/var/lib/dpkg"'
+          echo '  dpkg --instdir=/ --force-all -i "$DEPS_DIR"/*.deb || echo ">>> dpkg -i had errors (continuing)"'
+          echo '  dpkg --instdir=/ --force-all --configure -a || echo ">>> dpkg --configure had errors (continuing)"'
+          echo 'fi'
+          echo ''
           echo 'declare -a failed=()'
           echo 'declare -a built=()'
           echo "for pkg in ${PKGS_STR}; do"
@@ -324,7 +371,7 @@ TOOLSEOF
           echo '    echo ">>> FAILED: $pkg"'
           echo '  fi'
           echo 'done'
-          echo 'echo ""'
+          echo ''
           echo 'echo "=================================================="'
           echo "echo \">>> built \${#built[@]}: \${built[*]:-<none>}\""
           echo "echo \">>> failed \${#failed[@]}: \${failed[*]:-<none>}\""
