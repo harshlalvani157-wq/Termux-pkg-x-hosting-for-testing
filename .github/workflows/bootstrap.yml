@@ -37,7 +37,6 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Count .deb assets on a given release. Prints an integer.
           count_debs() {
             local tag="$1"
             local n
@@ -51,18 +50,15 @@ jobs:
 
           if [ -n "$INPUT_TAG" ]; then
             TAG="$INPUT_TAG"
-            echo ">>> user-provided tag: $TAG"
             count=$(count_debs "$TAG")
-            echo ">>> .deb assets on $TAG: $count"
+            echo ">>> user-provided tag: $TAG (${count} .deb assets)"
             if [ "${count:-0}" -eq 0 ]; then
               echo "::error::Release '${TAG}' has no .deb assets"
-              echo ">>> assets on that release:"
               gh release view "$TAG" --repo "${{ github.repository }}" \
                 --json assets --jq '.assets[]?.name // empty' || true
               exit 1
             fi
           else
-            echo ">>> no input tag — searching releases for one with .deb assets"
             mapfile -t TAGS < <(
               gh release list --repo "${{ github.repository }}" \
                 --limit 200 \
@@ -73,17 +69,13 @@ jobs:
               echo "::error::No non-bootstrap releases in this repo."
               exit 1
             fi
-            echo ">>> ${#TAGS[@]} candidate tag(s); newest first:"
-            printf '    %s\n' "${TAGS[@]}"
-
             TAG=""
             for t in "${TAGS[@]}"; do
               [ -z "$t" ] && continue
               c=$(count_debs "$t")
               echo "    $t -> ${c} .deb asset(s)"
               if [ "${c:-0}" -gt 0 ]; then
-                TAG="$t"
-                break
+                TAG="$t"; break
               fi
             done
             if [ -z "$TAG" ]; then
@@ -145,7 +137,7 @@ jobs:
         run: |
           set -euo pipefail
           python3 << 'PYEOF'
-          import subprocess, os, sys
+          import subprocess, os
           from collections import defaultdict
 
           ARCH = os.environ["ARCH"]
@@ -175,6 +167,18 @@ jobs:
               except subprocess.CalledProcessError:
                   return ""
 
+          def parse_list(raw):
+              out = []
+              for part in raw.split(","):
+                  part = part.strip()
+                  if not part:
+                      continue
+                  first = part.split("|")[0].strip()
+                  first = first.split("(")[0].strip()
+                  if first:
+                      out.append(first)
+              return out
+
           pkg_info = {}
           provides_map = defaultdict(list)
           for f in sorted(os.listdir(deb_dir)):
@@ -187,18 +191,6 @@ jobs:
               arch = dpkg_field(path, "Architecture")
               depends_raw = dpkg_field(path, "Depends") or dpkg_field(path, "Pre-Depends")
               provides_raw = dpkg_field(path, "Provides")
-
-              def parse_list(raw):
-                  out = []
-                  for part in raw.split(","):
-                      part = part.strip()
-                      if not part:
-                          continue
-                      first = part.split("|")[0].strip()
-                      first = first.split("(")[0].strip()
-                      if first:
-                          out.append(first)
-                  return out
 
               pkg_info[name] = {
                   "path": path,
@@ -283,8 +275,7 @@ jobs:
               name=$(dpkg-deb -f "$deb" Package 2>/dev/null || echo "")
               arch=$(dpkg-deb -f "$deb" Architecture 2>/dev/null || echo "")
               if [ "$name" = "$pkg" ] && { [ "$arch" = "all" ] || [ "$arch" = "$ARCH" ]; }; then
-                found="$deb"
-                break
+                found="$deb"; break
               fi
             done
             if [ -n "$found" ]; then
@@ -325,8 +316,6 @@ jobs:
           shopt -u nullglob
 
           ls -la "$STAGING"
-          ls "$STAGING/lib/" > /tmp/lib-list.txt 2>/dev/null || true
-          head -20 /tmp/lib-list.txt || true
 
       - name: Verify key libraries are present
         run: |
@@ -366,29 +355,51 @@ jobs:
             > staging/etc/apt/sources.list
           cat staging/etc/apt/sources.list
 
+      # =================================================================
+      # FIX: don't delete the shipped subgroup mirror files. pkg's
+      # mirror_is_set() check and termux-change-repo both iterate the
+      # subgroup dirs (asia/, europe/, …) with find. Keep them.
+      # We only overwrite the top-level `default` and force pkg to use
+      # it via MIRROR_GROUP="default".
+      # =================================================================
       - name: Force pkg to use only our mirror
         run: |
           set -euo pipefail
           MIRROR_DIR="staging/etc/termux/mirrors"
           mkdir -p "$MIRROR_DIR"
-          D="$MIRROR_DIR/default"
-          {
-            echo "# This file is sourced by pkg"
-            echo "WEIGHT=10"
-            echo 'MAIN="https://xodiosx.github.io/Termux-pkg-x"'
-          } > "$D"
-          find "$MIRROR_DIR" -mindepth 1 -type f ! -name default -delete 2>/dev/null || true
-          find "$MIRROR_DIR" -mindepth 1 -type d -empty -delete 2>/dev/null || true
 
+          # Overwrite top-level default with our repo
+          cat > "$MIRROR_DIR/default" <<'EOF'
+          # This file is sourced by pkg
+          WEIGHT=10
+          MAIN="https://xodiosx.github.io/Termux-pkg-x"
+          EOF
+
+          # Re-create the standard subgroup dirs in case the termux-tools
+          # .deb omitted any (they're part of the shipped package but be safe).
+          for group in all asia chinese_mainland europe india north_america oceania russia south_america special; do
+            mkdir -p "$MIRROR_DIR/$group"
+          done
+
+          # Force pkg to always read our default file by injecting an
+          # early override right after the shebang.
           PKG="staging/bin/pkg"
           if [ -f "$PKG" ]; then
-            grep -q TERMUX_PKG_NO_MIRROR_SELECT "$PKG" || \
-              echo 'TERMUX_PKG_NO_MIRROR_SELECT=1' >> "$PKG"
+            if ! grep -q 'FORCED_BY_XODIOSX' "$PKG"; then
+              awk 'NR==1 { print; print "# FORCED_BY_XODIOSX: force default mirror"; print "MIRROR_GROUP=\"default\""; print "export MIRROR_GROUP"; next } { print }' "$PKG" > "$PKG.new"
+              mv "$PKG.new" "$PKG"
+              chmod +x "$PKG"
+            fi
             sed -i 's|deb \$MAIN|deb [trusted=yes] \$MAIN|g' "$PKG" || true
+            sed -i 's|"URIs: \$MAIN"|"URIs: [trusted=yes] \$MAIN"|g' "$PKG" || true
           fi
 
+          echo ">>> mirrors/ top level:"
           ls -la "$MIRROR_DIR"
-          cat "$D"
+          echo ">>> mirrors/default:"
+          cat "$MIRROR_DIR/default"
+          echo ">>> pkg header:"
+          head -5 "$PKG" 2>/dev/null || true
 
       - name: Disable signature verification + strip keyring
         run: |
