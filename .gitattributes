@@ -28,3 +28,4 @@
 *.deb binary
 *.ddeb binary
 *.gz binary
+*.xz binary
