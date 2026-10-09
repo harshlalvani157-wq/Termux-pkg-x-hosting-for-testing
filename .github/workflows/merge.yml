@@ -1,0 +1,261 @@
+name: Merge Release Debs
+
+on:
+  workflow_dispatch:
+    inputs:
+      tags:
+        description: "Space-separated list of release tags to merge (leave empty to auto-discover)"
+        required: false
+        default: ""
+      release_tag:
+        description: "Tag for the new merged release (leave empty for auto-generated 'merged-YYYY.MM.DD-HHMMSS')"
+        required: false
+        default: ""
+      delete_sources:
+        description: "Delete the source releases after a successful merge"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: merge-release-debs
+  cancel-in-progress: false
+
+jobs:
+  merge:
+    runs-on: ubuntu-24.04
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      REPO: ${{ github.repository }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with: { fetch-depth: 1 }
+
+      - name: Install tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq dpkg-dev
+
+      # -----------------------------------------------------------------
+      # Resolve the list of tags (ascending by tag name = oldest → newest)
+      # -----------------------------------------------------------------
+      - name: Resolve list of tags
+        id: resolve
+        env:
+          INPUT_TAGS: ${{ inputs.tags }}
+          INPUT_OUT_TAG: ${{ inputs.release_tag }}
+        run: |
+          set -euo pipefail
+
+          if [ -n "$INPUT_TAGS" ]; then
+            read -a TAGS <<< "$INPUT_TAGS"
+          else
+            mapfile -t TAGS < <(
+              gh release list --repo "$REPO" --limit 500 \
+                --json tagName,createdAt \
+                --jq 'sort_by(.createdAt) | .[].tagName | select(startswith("bootstrap-") | not) | select(startswith("merged-") | not)'
+            )
+          fi
+
+          if [ "${#TAGS[@]}" -eq 0 ]; then
+            echo "::error::No tags to process"
+            exit 1
+          fi
+
+          # Ascending sort: 2026.10.03-… < 2026.10.08-… < 2026.10.09-…
+          mapfile -t TAGS < <(printf '%s\n' "${TAGS[@]}" | sort)
+
+          echo ">>> ${#TAGS[@]} tag(s), oldest first:"
+          printf '    %s\n' "${TAGS[@]}"
+
+          printf '%s\n' "${TAGS[@]}" > /tmp/tags.txt
+
+          if [ -n "$INPUT_OUT_TAG" ]; then
+            OUT="$INPUT_OUT_TAG"
+          else
+            OUT="merged-$(date -u +'%Y.%m.%d-%H%M%S')"
+          fi
+          echo "output_tag=$OUT" >> "$GITHUB_OUTPUT"
+          echo ">>> output tag: $OUT"
+
+      # -----------------------------------------------------------------
+      # Download each release, in order. Track Package names in an
+      # associative array. Newer files replace older ones.
+      # -----------------------------------------------------------------
+      - name: Download and merge .deb files (newest wins)
+        run: |
+          set -euo pipefail
+          mkdir -p merged
+
+          declare -A seen       # pkg name -> filename stored in merged/
+          declare -A seen_tag   # pkg name -> source tag
+
+          total_downloaded=0
+          total_superseded=0
+          tags_processed=0
+
+          while IFS= read -r tag; do
+            [ -z "$tag" ] && continue
+            echo "=================================================="
+            echo ">>> processing release: $tag"
+            echo "=================================================="
+
+            tmpdir=$(mktemp -d)
+            if ! gh release download "$tag" --repo "$REPO" --pattern "*.deb" --dir "$tmpdir" 2>/tmp/gh_err.log; then
+              echo ">>> WARN: no .deb files in $tag (or download failed)"
+              sed -n '1,5p' /tmp/gh_err.log || true
+              rm -rf "$tmpdir"
+              continue
+            fi
+
+            tags_processed=$((tags_processed + 1))
+            count=$(find "$tmpdir" -maxdepth 1 -type f -name '*.deb' | wc -l)
+            echo ">>> downloaded ${count} .deb file(s)"
+            total_downloaded=$((total_downloaded + count))
+
+            while IFS= read -r -d '' deb; do
+              pkg=$(dpkg-deb -f "$deb" Package 2>/dev/null || echo "")
+              if [ -z "$pkg" ]; then
+                echo ">>> SKIP unparsable: $(basename "$deb")"
+                continue
+              fi
+              ver=$(dpkg-deb -f "$deb" Version 2>/dev/null || echo "")
+
+              if [ -n "${seen[$pkg]:-}" ]; then
+                echo ">>> superseding $pkg $ver (old: ${seen[$pkg]} from ${seen_tag[$pkg]})"
+                rm -f "merged/${seen[$pkg]}"
+                total_superseded=$((total_superseded + 1))
+              fi
+
+              base=$(basename "$deb")
+              cp -a "$deb" "merged/$base"
+              seen[$pkg]="$base"
+              seen_tag[$pkg]="$tag"
+            done < <(find "$tmpdir" -maxdepth 1 -type f -name '*.deb' -print0)
+
+            rm -rf "$tmpdir"
+          done < /tmp/tags.txt
+
+          echo ""
+          echo "=================================================="
+          echo ">>> tags processed:   $tags_processed"
+          echo ">>> total downloaded: $total_downloaded"
+          echo ">>> total superseded: $total_superseded"
+          echo ">>> final merged set: $(find merged -maxdepth 1 -type f -name '*.deb' | wc -l) .deb file(s)"
+          echo "=================================================="
+
+      # -----------------------------------------------------------------
+      # Sanity check the merged set.
+      # -----------------------------------------------------------------
+      - name: Sanity check merged set
+        run: |
+          set -euo pipefail
+          n=$(find merged -maxdepth 1 -type f -name '*.deb' | wc -l)
+          if [ "$n" -eq 0 ]; then
+            echo "::error::No .deb files in merged set — nothing to publish"
+            exit 1
+          fi
+
+          echo ">>> merged .deb files (first 30):"
+          find merged -maxdepth 1 -type f -name '*.deb' -printf '%f\n' | sort > /tmp/merged-list.txt
+          head -30 /tmp/merged-list.txt
+
+          echo ""
+          echo ">>> unique package count:"
+          while IFS= read -r deb; do
+            dpkg-deb -f "merged/$deb" Package
+          done < /tmp/merged-list.txt | sort -u | wc -l
+
+      # -----------------------------------------------------------------
+      # Create the output release.
+      # -----------------------------------------------------------------
+      - name: Create merged release
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.resolve.outputs.output_tag }}"
+
+          SOURCES=""
+          while IFS= read -r t; do
+            [ -z "$t" ] && continue
+            SOURCES="${SOURCES}- ${t}"$'\n'
+          done < /tmp/tags.txt
+
+          printf 'Merged .deb set. For any package appearing in multiple sources, the newest release wins.\n\nSources merged (oldest first):\n%s' "$SOURCES" > /tmp/notes.txt
+
+          gh release create "$TAG" \
+            --repo "$REPO" \
+            --title "Merged debs $TAG" \
+            --notes-file /tmp/notes.txt \
+            --target "${{ github.sha }}" \
+            || { echo "::error::Failed to create release '$TAG'"; exit 1; }
+          echo ">>> created release $TAG"
+
+      # -----------------------------------------------------------------
+      # Upload every merged .deb.
+      # -----------------------------------------------------------------
+      - name: Upload merged .deb files
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.resolve.outputs.output_tag }}"
+          mapfile -t FILES < <(find merged -maxdepth 1 -type f -name '*.deb' | sort)
+          total="${#FILES[@]}"
+          echo ">>> uploading $total files"
+
+          i=0
+          failed=0
+          for f in "${FILES[@]}"; do
+            i=$((i + 1))
+            printf '[%d/%d] %s ... ' "$i" "$total" "$(basename "$f")"
+            ok=0
+            for attempt in 1 2 3 4 5; do
+              if gh release upload "$TAG" "$f" --repo "$REPO" --clobber 2>/tmp/gh_err.log; then
+                ok=1
+                break
+              fi
+              if grep -qiE 'secondary rate limit|abuse|rate limit' /tmp/gh_err.log; then
+                backoff=$((attempt * 15))
+              else
+                backoff=$((attempt * 3))
+              fi
+              sleep "$backoff"
+            done
+            if [ "$ok" -eq 1 ]; then
+              echo ok
+            else
+              echo "FAILED: $(basename "$f")"
+              failed=$((failed + 1))
+            fi
+            sleep 1
+          done
+
+          if [ "$failed" -gt 0 ]; then
+            echo "::error::${failed}/${total} failed"
+            exit 1
+          fi
+          echo ">>> all ${total} uploaded"
+
+      - name: Verify merged release
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.resolve.outputs.output_tag }}"
+          count=$(gh release view "$TAG" --repo "$REPO" --json assets --jq '.assets | length')
+          echo ">>> release $TAG has $count assets"
+
+      # -----------------------------------------------------------------
+      # Optional: delete the source releases after a successful merge.
+      # -----------------------------------------------------------------
+      - name: Optionally delete source releases
+        if: ${{ inputs.delete_sources == 'true' }}
+        run: |
+          set -euo pipefail
+          NEW_TAG="${{ steps.resolve.outputs.output_tag }}"
+          while IFS= read -r tag; do
+            [ -z "$tag" ] && continue
+            [ "$tag" = "$NEW_TAG" ] && continue
+            echo ">>> deleting release $tag"
+            gh release delete "$tag" --repo "$REPO" --yes --cleanup-tag || true
+          done < /tmp/tags.txt
+          echo ">>> done"
