@@ -1,32 +1,32 @@
 Architectures: aarch64 all
 Codename: stable
 Components: main
-Date: Fri, 09 Oct 2026 00:09:56 +0000
+Date: Fri, 09 Oct 2026 22:42:57 +0000
 Description: xodiosx custom Termux packages
 Label: Termux-pkg-x
 Origin: xodiosx
 Suite: stable
 MD5Sum:
- cf5ceccaeaf931b32bad4b47efe1f014              193 Release
- ec9fdd1c5590dce76c2ecd907caa5a80           143738 main/binary-aarch64/Packages
- 816184c5d25870cb22680a91794015fc            46668 main/binary-aarch64/Packages.gz
- bbdd8a1f85a75b93ba7f9ae81bb83528            13340 main/binary-all/Packages
- 7caa2bc10ba2f32aff698a6f6c08bde2             4971 main/binary-all/Packages.gz
+ e35642950502f3d75842e60929e021d4              193 Release
+ 392e209770ad67abff7f89cee3d1f67b           199805 main/binary-aarch64/Packages
+ 6d56cef12ce1b2c25f3ed874050bc09e            65154 main/binary-aarch64/Packages.gz
+ 290c225d708c32b23cbe13df5a1e6cde            14765 main/binary-all/Packages
+ a7b25b44a7a23f3a70265800db4e8828             5481 main/binary-all/Packages.gz
 SHA1:
- 965d9c8ed05a72f23f9570ae61ae880fa99e40c4              193 Release
- 3fd97193e38223366547e46c664559a9ffd7a51e           143738 main/binary-aarch64/Packages
- e4aadcd6ac28a57965276f02164bf50495350de3            46668 main/binary-aarch64/Packages.gz
- 221e0874798fd6dd9e3912864921fc349f1df5e9            13340 main/binary-all/Packages
- 673aef7700185c1ea1f97e07737ee1aacbeb5a6f             4971 main/binary-all/Packages.gz
+ 14dc553024febeaafe8bfe2005a5d5292c95e3ad              193 Release
+ 6f527e17171dde1d1978d7a50631f1fe5f310ffe           199805 main/binary-aarch64/Packages
+ 5cc4c3c0d8218cf5b44a696cf8d2bee4125aa495            65154 main/binary-aarch64/Packages.gz
+ c92c13dfde88f56cf462f0ef395e1217b9b66fe5            14765 main/binary-all/Packages
+ eec304a9a38f37485e927e7cfedd58e6422356a0             5481 main/binary-all/Packages.gz
 SHA256:
- 166607f30bb58864ca1e9be372b79370dd29b1681abfc93370e8019fc38ca071              193 Release
- 4d96d344b986d03fed727308d795acf50677c47a117347297ce5dd24e70ae02f           143738 main/binary-aarch64/Packages
- 0c5375ad79cd353b11fdaef1cad1c8300e5d3e77d6431e007162a3284843debe            46668 main/binary-aarch64/Packages.gz
- d888341164caed57e22fbcf09a9981e46552a3dfd57e92d8cf5179a2f652927f            13340 main/binary-all/Packages
- 5ec23a1a72f023f55ece4abc5e805e44e8119935024be7031e38f26cfb2290c5             4971 main/binary-all/Packages.gz
+ b3f561c9ea882f4e3b1cd976a9ad5c36707c6a62b66c3e8db44d3bb9ca28cc66              193 Release
+ 0a3548421d573499a69e83073be9be70b24db4d3cde45d50d06e659536756c26           199805 main/binary-aarch64/Packages
+ 792f2325e43b2c99a4eeba9eb53ddd453bffd59b768d7e6952f84841dc9b9fc5            65154 main/binary-aarch64/Packages.gz
+ bf4f5afd77c670900e29679325bee48fafca74c85d6b25d98e5f056b392f745a            14765 main/binary-all/Packages
+ bef0dac5280ab892fa2b1188520b5de1cba56190a711c8d5cd047e5b52506763             5481 main/binary-all/Packages.gz
 SHA512:
- 19707384e7c1556ebe6c9a702820e1c2938756b7208d3250c99b9e3ad7c449b5286da020e11b5bd7ca19a04ba473ba1b4f71e3b37dcc244759362aa5171d7a16              193 Release
- 1136b9efa58ae725f2603b538d32c0dc172dfa014a681540a19e5dab190e6919f972e8f87d4a16a340318908db4d62a199e4706dce660eea7aaab5599455bc31           143738 main/binary-aarch64/Packages
- 7e6c8c41a63d539730abc28612b14b00aa3896bcc57f093c8e96bbbfd7670984dea9a37c1f51d1cf7cf1cb6b141890e54bc07c1f579a65d8d02e558c104a6ed5            46668 main/binary-aarch64/Packages.gz
- fec70767559f6523b7600d1906dac2a3eb92bd4895103bcc1e8a0aa946fe4f5c17652016319d62e5be4834d1a535df576bec144991505cc6cc698eedda5fef73            13340 main/binary-all/Packages
- 6ecd6432a1e95150c08ee79cfbeaa40b6a17aa7be26dccdd6bdd1b0df79b508f3951c313ca66f448df6f63a7dc7235da9c41d69c2324e25f14b9f62f80d76976             4971 main/binary-all/Packages.gz
+ 82d5b9d1360a1552d940850a91c2e619ef5c100f759cf9b59ee0a0d6c26440b90f10d005ab0cf1daec555d345f4f7aebc633e212bef3f4b3924f17e62ec9923c              193 Release
+ a16710ebfc45396351a77c23f6f73aaeacf7fc30354a73d184754bc1897fc10706e48766249593b8610b8a01fd95e2297f32983f3bc0c13d4e2e1e9660959e9a           199805 main/binary-aarch64/Packages
+ 95b6d63e7eec5d6a10efb95ca48a9872fe22a9b32159c239cadc8631441c7f10e2335f4ebb09f2d28fde549fad17f0c090bc157a40b270cc07f048ad6c3bbfe6            65154 main/binary-aarch64/Packages.gz
+ ef4e849bbc40628496ce4003ea7bfe71dafa7221d4a520abe413699db2b25fe31d615ab66cf11674fe2253a2bac28f51c9920109d118cb9745b60a9edd0e87d0            14765 main/binary-all/Packages
+ e0331853d09531d7635984825ff510e84393b0e6e5ef04d06a999f159c61200d1eb43059c5f23d627af2dd0f2ffdc31a303fbe739d39186ca021e55f54825e0f             5481 main/binary-all/Packages.gz
