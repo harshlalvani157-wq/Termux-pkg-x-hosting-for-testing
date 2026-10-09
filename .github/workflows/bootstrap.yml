@@ -1,4 +1,4 @@
-name: Generate bootstrap archives
+name: Generate bootstrap XoDos 
 
 on:
   schedule:
@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       release_tag:
-        description: "Release tag to pull .deb files from (leave empty for latest)"
+        description: "Release tag to pull .deb files from (leave empty for latest with .deb assets)"
         required: false
         default: ""
       arch:
@@ -36,19 +36,41 @@ jobs:
           INPUT_ARCH: ${{ inputs.arch }}
         run: |
           set -euo pipefail
+
+          pick_tag_with_debs() {
+            # Emit the newest non-bootstrap release whose assets include *.deb
+            gh api "repos/${{ github.repository }}/releases?per_page=100" \
+              --jq '.[]
+                     | select(.tag_name | startswith("bootstrap-") | not)
+                     | select([.assets[].name] | any(endswith(".deb")))
+                     | .tag_name' \
+              | head -1
+          }
+
           if [ -n "$INPUT_TAG" ]; then
             TAG="$INPUT_TAG"
+            # Verify it actually has .deb assets
+            count=$(gh api "repos/${{ github.repository }}/releases/tags/${TAG}" \
+                      --jq '[.assets[].name] | map(select(endswith(".deb"))) | length' 2>/dev/null || echo "0")
+            if [ "$count" = "0" ] || [ -z "$count" ]; then
+              echo "::error::Release '${TAG}' has no .deb assets"
+              gh release view "$TAG" --repo "${{ github.repository }}" \
+                --json assets --jq '.assets[].name' || true
+              exit 1
+            fi
+            echo ">>> Using user-provided tag: $TAG (${count} .deb assets)"
           else
-            TAG="$(gh release list --repo "${{ github.repository }}" --limit 200 \
-              --json tagName,createdAt \
-              --jq '[.[] | select(.tagName | startswith("bootstrap-") | not)] | sort_by(.createdAt) | last | .tagName')"
+            TAG="$(pick_tag_with_debs)"
+            if [ -z "$TAG" ] || [ "$TAG" = "null" ]; then
+              echo "::error::No release with .deb assets found in this repo."
+              echo ">>> Available releases:"
+              gh release list --repo "${{ github.repository }}" --limit 20 || true
+              exit 1
+            fi
+            echo ">>> Auto-selected newest release with .deb assets: $TAG"
           fi
-          if [ -z "$TAG" ] || [ "$TAG" = "null" ]; then
-            echo "::error::No suitable release found"
-            exit 1
-          fi
+
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-          echo ">>> Using release tag: $TAG"
 
           if [ -z "$INPUT_ARCH" ] || [ "$INPUT_ARCH" = "all" ]; then
             ARCHS='["aarch64","arm","i686","x86_64"]'
@@ -89,6 +111,10 @@ jobs:
             --dir ./all-debs
           n=$(find ./all-debs -name '*.deb' | wc -l)
           echo ">>> downloaded: ${n} files"
+          if [ "$n" -eq 0 ]; then
+            echo "::error::No .deb files downloaded from release ${RELEASE_TAG}"
+            exit 1
+          fi
 
       - name: Resolve dependency closure
         env:
@@ -331,6 +357,39 @@ jobs:
           echo 'deb [trusted=yes] https://xodiosx.github.io/Termux-pkg-x stable main' \
             > staging/etc/apt/sources.list
           cat staging/etc/apt/sources.list
+
+      # -----------------------------------------------------------------
+      # Overwrite the built termux-tools' mirrors/default so pkg doesn't
+      # fall back to the Termux mirror list. This is what fixes `pkg up`
+      # still showing termux mirrors.
+      # -----------------------------------------------------------------
+      - name: Force pkg to use only our mirror
+        run: |
+          set -euo pipefail
+          MIRROR_DIR="staging/etc/termux/mirrors"
+          mkdir -p "$MIRROR_DIR"
+          D="$MIRROR_DIR/default"
+          {
+            echo "# This file is sourced by pkg"
+            echo "WEIGHT=10"
+            echo 'MAIN="https://xodiosx.github.io/Termux-pkg-x"'
+          } > "$D"
+          # Delete every other mirror file/folder
+          find "$MIRROR_DIR" -mindepth 1 -type f ! -name default -delete 2>/dev/null || true
+          find "$MIRROR_DIR" -mindepth 1 -type d -empty -delete 2>/dev/null || true
+
+          # If pkg is present, force no mirror selection
+          PKG="staging/bin/pkg"
+          if [ -f "$PKG" ]; then
+            grep -q TERMUX_PKG_NO_MIRROR_SELECT "$PKG" || \
+              echo 'TERMUX_PKG_NO_MIRROR_SELECT=1' >> "$PKG"
+            sed -i 's|deb \$MAIN|deb [trusted=yes] \$MAIN|g' "$PKG" || true
+          fi
+
+          echo ">>> mirrors/ contents:"
+          ls -la "$MIRROR_DIR"
+          echo ">>> mirrors/default:"
+          cat "$D"
 
       - name: Disable signature verification + strip keyring
         run: |
