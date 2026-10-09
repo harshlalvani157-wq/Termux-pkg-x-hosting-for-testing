@@ -68,16 +68,9 @@ jobs:
     - name: Ensure work directories exist
       run: mkdir -p ./artifacts ./debs
 
-    # =================================================================
-    # Drop root-packages duplicates (v4l-utils and anything else that
-    # also exists in packages/). Then delete root-packages from repo.json
-    # so buildorder.py never scans it.
-    # =================================================================
     - name: Drop duplicate root-packages
       run: |
         set -euo pipefail
-
-        # 1. Remove every root-package whose name also exists in packages/
         if [ -d root-packages ]; then
           for d in root-packages/*/; do
             [ -d "$d" ] || continue
@@ -88,27 +81,12 @@ jobs:
             fi
           done
         fi
-
-        # 2. Remove root-packages from repo.json
         if jq -e 'has("root-packages")' repo.json >/dev/null 2>&1; then
           jq 'del(.["root-packages"])' repo.json > repo.json.tmp
           mv repo.json.tmp repo.json
-          echo ">>> removed root-packages from repo.json"
         fi
-
-        echo ">>> remaining repo.json keys:"
         jq -r 'keys[]' repo.json
 
-        echo ">>> any leftover root-packages dirs:"
-        if [ -d root-packages ]; then
-          ls -la root-packages/ || true
-        else
-          echo "    (root-packages removed)"
-        fi
-
-    # =================================================================
-    # Global rename: com.termux -> app.xodos2
-    # =================================================================
     - name: Rename com.termux -> app.xodos2 globally
       run: |
         set -euo pipefail
@@ -120,45 +98,25 @@ jobs:
           -type f -print0 | \
         xargs -0 -r -n50 sed -i 's/com\.termux/app.xodos2/g'
 
-        echo ">>> TERMUX_APP__PACKAGE_NAME:"
         grep -nE '^TERMUX_APP__PACKAGE_NAME=' scripts/properties.sh || true
-        echo ">>> any remaining com.termux literals:"
-        grep -rIn 'com\.termux' . \
-          --exclude-dir=.git --exclude-dir=.github \
-          --exclude-dir=debs --exclude-dir=artifacts \
-          > /tmp/remaining.txt 2>/dev/null || true
-        head -20 /tmp/remaining.txt || echo "    (none)"
 
-    # =================================================================
-    # Patch apt package (custom repo + no keyring)
-    # =================================================================
     - name: Patch apt package (custom repo + no keyring)
       run: |
         set -euo pipefail
         APT_BUILD="packages/apt/build.sh"
         [ -f "$APT_BUILD" ] || { echo "::error::$APT_BUILD not found"; exit 1; }
-
         sed -i 's/, termux-keyring//g' "$APT_BUILD"
         sed -i 's/termux-keyring, //g' "$APT_BUILD"
         sed -i 's/ termux-keyring//g'  "$APT_BUILD"
         sed -i 's/termux-keyring//g'   "$APT_BUILD"
-
         sed -i 's|deb https://packages-cf\.termux\.dev/apt/termux-main/ stable main|deb [trusted=yes] https://xodiosx.github.io/Termux-pkg-x stable main|g' "$APT_BUILD"
         sed -i 's|deb https://packages-cf\.termux\.dev/apt/termux-main stable main|deb [trusted=yes] https://xodiosx.github.io/Termux-pkg-x stable main|g'  "$APT_BUILD"
         sed -i 's|deb https://packages\.termux\.dev/apt/termux-main/ stable main|# deb https://packages.termux.dev/apt/termux-main/ stable main|g'      "$APT_BUILD"
         sed -i 's|deb https://packages\.termux\.dev/apt/termux-main stable main|# deb https://packages.termux.dev/apt/termux-main/ stable main|g'        "$APT_BUILD"
 
-        echo ">>> TERMUX_PKG_DEPENDS:"
-        grep -n 'TERMUX_PKG_DEPENDS=' "$APT_BUILD" > /tmp/apt-dep.txt || true
-        head -1 /tmp/apt-dep.txt || true
-
-    # =================================================================
-    # Override repository URL
-    # =================================================================
     - name: Override repository URL (~/.termuxrc + setup variables)
       run: |
         set -euo pipefail
-
         {
           echo 'TERMUX_REPO_PACKAGE="app.xodos2"'
           echo 'TERMUX_REPO_URL=('
@@ -171,7 +129,6 @@ jobs:
           echo '  main'
           echo ')'
         } > "$HOME/.termuxrc"
-        cat "$HOME/.termuxrc"
 
         SETUP="scripts/build/termux_step_setup_variables.sh"
         if [ -f "$SETUP" ]; then
@@ -192,8 +149,6 @@ jobs:
             }
             { print }
           ' "$SETUP" > "$SETUP.new" && mv "$SETUP.new" "$SETUP"
-
-          grep -nE '^TERMUX_REPO_(URL|DISTRIBUTION|COMPONENT)=' "$SETUP" || true
         fi
 
     - name: Patch termux_download_deb_pac.sh
@@ -206,6 +161,10 @@ jobs:
           sed -i '/FORCED-BY-CI-FORCE-SOURCE-BUILD: return failure/a\    return 1' "$TDP"
         fi
 
+    # =================================================================
+    # Skip known-broken packages by editing them out of the summary file
+    # after it's produced. We still want to see them reported as skipped.
+    # =================================================================
     - name: Gather build summary
       id: build-info
       env:
@@ -219,8 +178,20 @@ jobs:
           read -a PACKAGES <<< "${MANUAL_INPUT_PACKAGES//$'\n'/ }"
           repo_paths=$(jq --raw-output 'del(.pkg_format) | keys | .[]' repo.json)
           declare -a resolved=()
+          declare -a skipped_broken=()
           for pkg in "${PACKAGES[@]}"; do
             if [ -z "$pkg" ]; then continue; fi
+
+            # --- Known-broken list: skip and report ---
+            case "$pkg" in
+              vkmark)
+                echo "::warning::Skipping '$pkg' — upstream Vulkan-Hpp 1.4.365 removed isDispatchLoader; package patch 0003 is stale."
+                skipped_broken+=("$pkg")
+                continue
+                ;;
+            esac
+            # ------------------------------------------
+
             for repo_path in $repo_paths; do
               repo=$(jq --raw-output '.["'${repo_path}'"].name' repo.json)
               if [ -d "${repo_path}/${pkg}" ]; then
@@ -234,6 +205,7 @@ jobs:
             done
           done
           echo ">>> resolved ${#resolved[@]}: ${resolved[*]:-<none>}"
+          echo ">>> skipped (known-broken) ${#skipped_broken[@]}: ${skipped_broken[*]:-<none>}"
           if [ "${#resolved[@]}" -eq 0 ]; then
             echo "::error::None found."
             exit 1
@@ -272,6 +244,10 @@ jobs:
       if: ${{ steps.build-info.outputs.free-space == 'true' }}
       run: ./scripts/free-space.sh
 
+    # =================================================================
+    # Build each package in its own invocation so a single failure
+    # doesn't stop the rest of the queue.
+    # =================================================================
     - name: Build packages
       run: |
         set -euo pipefail
@@ -285,24 +261,51 @@ jobs:
           fi
         done
         PKGS_STR="${packages[*]}"
-        echo ">>> packages: ${PKGS_STR}"
+        echo ">>> packages to build (${#packages[@]}): ${PKGS_STR}"
 
-        if [ "${#packages[@]}" -gt 0 ]; then
-          {
-            echo 'set -e'
-            echo 'PREFIX=/data/data/app.xodos2/files/usr'
-            echo 'BUILD_ROOT=/home/builder/termux-packages'
-            echo 'cd "$BUILD_ROOT"'
-            echo 'mkdir -p "$PREFIX/var/lib/dpkg/info"'
-            echo "echo '>>> Building: ${PKGS_STR}'"
-            echo "./build-package.sh -C -a aarch64 ${PKGS_STR}"
-          } > /tmp/inner-build.sh
-
-          cat /tmp/inner-build.sh
-          ENCODED=$(base64 -w0 /tmp/inner-build.sh)
-          ./scripts/run-docker.sh -d bash -c "echo '${ENCODED}' | base64 -d | bash" \
-            || echo "::warning::Some packages failed to build — continuing"
+        if [ "${#packages[@]}" -eq 0 ]; then
+          echo ">>> no packages — nothing to do"
+          exit 0
         fi
+
+        # Write an inner script that loops over packages and continues on failure.
+        {
+          echo 'set -uo pipefail'
+          echo 'PREFIX=/data/data/app.xodos2/files/usr'
+          echo 'BUILD_ROOT=/home/builder/termux-packages'
+          echo 'mkdir -p "$PREFIX/var/lib/dpkg/info"'
+          echo 'cd "$BUILD_ROOT"'
+          echo 'declare -a failed=()'
+          echo 'declare -a built=()'
+          echo "for pkg in ${PKGS_STR}; do"
+          echo '  echo "=================================================="'
+          echo '  echo ">>> Building: $pkg"'
+          echo '  echo "=================================================="'
+          echo '  if ./build-package.sh -C -a aarch64 "$pkg"; then'
+          echo '    built+=("$pkg")'
+          echo '    echo ">>> OK: $pkg"'
+          echo '  else'
+          echo '    failed+=("$pkg")'
+          echo '    echo ">>> FAILED: $pkg"'
+          echo '  fi'
+          echo 'done'
+          echo 'echo ""'
+          echo 'echo "=================================================="'
+          echo "echo \">>> built \${#built[@]}: \${built[*]:-<none>}\""
+          echo "echo \">>> failed \${#failed[@]}: \${failed[*]:-<none>}\""
+          echo 'echo "=================================================="'
+          echo 'if [ "${#failed[@]}" -gt 0 ]; then exit 2; fi'
+        } > /tmp/inner-build.sh
+
+        echo ">>> inner-build.sh:"
+        cat /tmp/inner-build.sh
+        echo ">>> ---"
+
+        ENCODED=$(base64 -w0 /tmp/inner-build.sh)
+
+        # Don't fail the workflow on partial failures — we handle that
+        # in a separate verification step below so all packages still try.
+        ./scripts/run-docker.sh -d bash -c "echo '${ENCODED}' | base64 -d | bash" || true
 
     - name: Generate build artifacts
       if: always()
@@ -334,6 +337,38 @@ jobs:
         n=$(find debs -type f -name '*.deb' 2>/dev/null | wc -l)
         echo ">>> debs/ contains: ${n} .deb files"
         tar cf "artifacts/debs-${{ matrix.target_arch }}-${{ github.sha }}.tar" debs
+
+    # =================================================================
+    # Fail loudly if any *requested* package produced no .deb.
+    # =================================================================
+    - name: Verify requested packages were built
+      if: always()
+      run: |
+        set -uo pipefail
+        missing=0
+        requested=()
+        for f in ./debs/built_*_packages.txt; do
+          [ -f "$f" ] || continue
+          while read -r p; do
+            [ -n "$p" ] && requested+=("$p")
+          done < "$f"
+        done
+        if [ "${#requested[@]}" -eq 0 ]; then
+          echo ">>> no requested packages — skipping verification"
+          exit 0
+        fi
+        for pkg in "${requested[@]}"; do
+          if ls debs/"${pkg}"_*.deb >/dev/null 2>&1; then
+            echo ">>> OK    $pkg"
+          else
+            echo ">>> MISS  $pkg"
+            missing=$((missing+1))
+          fi
+        done
+        echo ">>> missing: $missing"
+        if [ "$missing" -gt 0 ]; then
+          echo "::warning::$missing requested package(s) failed to build (see 'Build packages' log)"
+        fi
 
     - name: Store *.deb files
       if: always()
@@ -390,11 +425,10 @@ jobs:
             fi
             if grep -qiE 'secondary rate limit|abuse|rate limit' /tmp/gh_err.log; then
               backoff=$((attempt * 15))
-              sleep "$backoff"
             else
               backoff=$((attempt * 3))
-              sleep "$backoff"
             fi
+            sleep "$backoff"
           done
           if [ "$ok" -eq 1 ]; then
             echo ok
