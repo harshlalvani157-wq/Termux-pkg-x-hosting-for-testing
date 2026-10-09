@@ -65,31 +65,111 @@ jobs:
       uses: actions/checkout@v6
       with: { fetch-depth: 1000 }
 
-    - name: Drop duplicate root-packages
+    # =================================================================
+    # 1. Rename com.termux -> app.xodos2 everywhere.
+    #    This is the VHEditor-style blunt replacement. It rewrites:
+    #      - properties.sh package name
+    #      - hardcoded /data/data/com.termux paths in build.sh files
+    #      - strings inside *.patch files
+    #      - subapp identifiers (com.termux.api -> app.xodos2.api, etc.)
+    #    Only .git, .github and the build output dirs are excluded.
+    # =================================================================
+    - name: Rename com.termux -> app.xodos2 globally
       run: |
         set -euo pipefail
-        for p in v4l-utils; do
-          if [ -d "root-packages/$p" ]; then
-            rm -rf "root-packages/$p"
-          fi
-        done
-        if jq -e 'has("root-packages")' repo.json >/dev/null; then
-          jq 'del(.["root-packages"])' repo.json > repo.json.tmp && mv repo.json.tmp repo.json
-        fi
-
-    - name: Patch prefix path + main app name
-      run: |
-        set -euo pipefail
-        sed -i 's|^TERMUX_APP__PACKAGE_NAME=.*|TERMUX_APP__PACKAGE_NAME="app.xodos2"|' \
-          scripts/properties.sh
         find . \
           -path ./.git -prune -false -o \
           -path ./.github -prune -false -o \
           -path ./debs -prune -false -o \
+          -path ./artifacts -prune -false -o \
           -type f -print0 | \
-        xargs -0 -r -n50 sed -i 's|/data/data/com\.termux|/data/data/app.xodos2|g'
+        xargs -0 -r -n50 sed -i 's/com\.termux/app.xodos2/g'
 
-    - name: Override repository URL (~/.termuxrc)
+        echo ">>> sanity: TERMUX_APP__PACKAGE_NAME"
+        grep -nE '^TERMUX_APP__PACKAGE_NAME=' scripts/properties.sh
+        echo ">>> remaining com.termux literals (should be none outside .git/.github)"
+        grep -rIn 'com\.termux' . \
+          --exclude-dir=.git --exclude-dir=.github --exclude-dir=debs \
+          | head -20 || echo "    (none)"
+
+    # =================================================================
+    # 2. Patch packages/apt/build.sh:
+    #      - drop termux-keyring from TERMUX_PKG_DEPENDS
+    #      - write our own sources.list with [trusted=yes]
+    # =================================================================
+    - name: Patch apt package (custom repo + no keyring)
+      run: |
+        set -euo pipefail
+        APT_BUILD="packages/apt/build.sh"
+        [ -f "$APT_BUILD" ] || { echo "::error::$APT_BUILD not found"; exit 1; }
+
+        python3 - <<'PY'
+        import re, pathlib
+        p = pathlib.Path("packages/apt/build.sh")
+        s = p.read_text()
+        changed = False
+
+        # (a) Remove termux-keyring from TERMUX_PKG_DEPENDS
+        def fix_depends(m):
+            parts = [x.strip() for x in m.group(1).split(',')
+                     if x.strip() and x.strip() != 'termux-keyring']
+            return 'TERMUX_PKG_DEPENDS="' + ', '.join(parts) + '"'
+        s2 = re.sub(r'TERMUX_PKG_DEPENDS="([^"]*)"', fix_depends, s, count=1)
+        if s2 != s:
+            s = s2
+            changed = True
+            print(">>> removed termux-keyring from TERMUX_PKG_DEPENDS")
+
+        # (b) Replace the sources.list generation block.
+        old_block = (
+            '{\n'
+            '\t\techo "# The main termux repository, with cloudflare cache"\n'
+            '\t\techo "deb https://packages-cf.termux.dev/apt/termux-main/ stable main"\n'
+            '\t\techo "# The main termux repository, without cloudflare cache"\n'
+            '\t\techo "# deb https://packages.termux.dev/apt/termux-main/ stable main"\n'
+            '\t} > $TERMUX_PREFIX/etc/apt/sources.list'
+        )
+        new_block = (
+            '{\n'
+            '\t\techo "deb [trusted=yes] https://xodiosx.github.io/Termux-pkg-x stable main"\n'
+            '\t} > $TERMUX_PREFIX/etc/apt/sources.list'
+        )
+        if old_block in s:
+            s = s.replace(old_block, new_block)
+            changed = True
+            print(">>> replaced full sources.list block")
+        else:
+            # Fallback: line-wise URL swap
+            s3 = re.sub(
+                r'deb https://packages-cf\.termux\.dev/apt/termux-main/?\s+stable\s+main',
+                'deb [trusted=yes] https://xodiosx.github.io/Termux-pkg-x stable main',
+                s,
+            )
+            s3 = re.sub(
+                r'deb https://packages\.termux\.dev/apt/termux-main/?\s+stable\s+main',
+                '# deb https://packages.termux.dev/apt/termux-main/ stable main',
+                s3,
+            )
+            if s3 != s:
+                s = s3
+                changed = True
+                print(">>> fallback URL swap applied")
+
+        if changed:
+            p.write_text(s)
+            print(">>> patched:", p)
+        else:
+            print("WARNING: no changes to packages/apt/build.sh")
+        PY
+
+        echo ">>> after patch:"
+        grep -n 'TERMUX_PKG_DEPENDS=' "$APT_BUILD" | head -1
+        grep -A6 'termux_step_post_make_install' "$APT_BUILD" | head -12
+
+    # =================================================================
+    # 3. Point the build environment at our repo.
+    # =================================================================
+    - name: Override repository URL (~/.termuxrc + setup variables)
       run: |
         set -euo pipefail
         cat > "$HOME/.termuxrc" <<'EOF'
@@ -104,41 +184,27 @@ jobs:
           main
         )
         EOF
-        cat "$HOME/.termuxrc"
 
-    # =================================================================
-    # Bake custom repo URL into the build environment so the
-    # termux-tools .deb ships a sources.list pointing at OUR repo,
-    # not at packages-cf.termux.dev.
-    # =================================================================
-    - name: Bake custom repo URL into build environment
-      run: |
-        set -euo pipefail
         SETUP="scripts/build/termux_step_setup_variables.sh"
-        [ -f "$SETUP" ] || { echo "::error::$SETUP not found"; exit 1; }
-
-        python3 - <<'PY'
-        import re, pathlib
-        p = pathlib.Path("scripts/build/termux_step_setup_variables.sh")
-        s = p.read_text()
-
-        new_block = (
-            'TERMUX_REPO_URL=(https://xodiosx.github.io/Termux-pkg-x)\n'
-            'TERMUX_REPO_DISTRIBUTION=(stable)\n'
-            'TERMUX_REPO_COMPONENT=(main)\n'
-        )
-
-        for var in ("TERMUX_REPO_URL", "TERMUX_REPO_DISTRIBUTION", "TERMUX_REPO_COMPONENT"):
-            s = re.sub(rf'^{var}=\([^)]*\)\n?', '', s, flags=re.MULTILINE)
-            s = re.sub(rf'^{var}=[^\n]*\n?', '', s, flags=re.MULTILINE)
-
-        s = s.replace("TERMUX_BUILD_TUPLE=", new_block + "TERMUX_BUILD_TUPLE=", 1)
-        p.write_text(s)
-        print(">>> Patched:", p)
-        PY
-
-        echo ">>> After patch:"
-        grep -nE '^TERMUX_REPO_(URL|DISTRIBUTION|COMPONENT)=' "$SETUP" || true
+        if [ -f "$SETUP" ]; then
+          python3 - <<'PY'
+          import re, pathlib
+          p = pathlib.Path("scripts/build/termux_step_setup_variables.sh")
+          s = p.read_text()
+          new_block = (
+              'TERMUX_REPO_URL=(https://xodiosx.github.io/Termux-pkg-x)\n'
+              'TERMUX_REPO_DISTRIBUTION=(stable)\n'
+              'TERMUX_REPO_COMPONENT=(main)\n'
+          )
+          for var in ("TERMUX_REPO_URL", "TERMUX_REPO_DISTRIBUTION", "TERMUX_REPO_COMPONENT"):
+              s = re.sub(rf'^{var}=\([^)]*\)\n?', '', s, flags=re.MULTILINE)
+              s = re.sub(rf'^{var}=[^\n]*\n?', '', s, flags=re.MULTILINE)
+          s = s.replace("TERMUX_BUILD_TUPLE=", new_block + "TERMUX_BUILD_TUPLE=", 1)
+          p.write_text(s)
+          print(">>> patched:", p)
+          PY
+          grep -nE '^TERMUX_REPO_(URL|DISTRIBUTION|COMPONENT)=' "$SETUP" || true
+        fi
 
     - name: Patch termux_download_deb_pac.sh
       run: |
@@ -262,7 +328,7 @@ jobs:
     steps:
     - uses: actions/checkout@v6
       with: { fetch-depth: 1 }
-    - uses: actions/download-artifact@v7
+    - uses: actions/download-artifact@v6
       with: { path: ./all-artifacts }
 
     - name: Extract .deb files from tarballs
@@ -300,3 +366,4 @@ jobs:
           sleep 1
         done
         [ "$failed" -gt 0 ] && { echo "::error::${failed}/${total} failed"; exit 1; }
+        echo ">>> all ${total} uploaded"
