@@ -70,14 +70,12 @@ jobs:
         set -euo pipefail
         for p in v4l-utils; do
           if [ -d "root-packages/$p" ]; then
-            echo ">>> removing root-packages/$p (duplicate)"
             rm -rf "root-packages/$p"
           fi
         done
         if jq -e 'has("root-packages")' repo.json >/dev/null; then
           jq 'del(.["root-packages"])' repo.json > repo.json.tmp && mv repo.json.tmp repo.json
         fi
-        jq -r 'keys[]' repo.json
 
     - name: Patch prefix path + main app name
       run: |
@@ -90,9 +88,8 @@ jobs:
           -path ./debs -prune -false -o \
           -type f -print0 | \
         xargs -0 -r -n50 sed -i 's|/data/data/com\.termux|/data/data/app.xodos2|g'
-        grep -nE '^TERMUX_APP__PACKAGE_NAME=' scripts/properties.sh
 
-    - name: Override repository URL
+    - name: Override repository URL (~/.termuxrc)
       run: |
         set -euo pipefail
         cat > "$HOME/.termuxrc" <<'EOF'
@@ -108,6 +105,40 @@ jobs:
         )
         EOF
         cat "$HOME/.termuxrc"
+
+    # =================================================================
+    # Bake custom repo URL into the build environment so the
+    # termux-tools .deb ships a sources.list pointing at OUR repo,
+    # not at packages-cf.termux.dev.
+    # =================================================================
+    - name: Bake custom repo URL into build environment
+      run: |
+        set -euo pipefail
+        SETUP="scripts/build/termux_step_setup_variables.sh"
+        [ -f "$SETUP" ] || { echo "::error::$SETUP not found"; exit 1; }
+
+        python3 - <<'PY'
+        import re, pathlib
+        p = pathlib.Path("scripts/build/termux_step_setup_variables.sh")
+        s = p.read_text()
+
+        new_block = (
+            'TERMUX_REPO_URL=(https://xodiosx.github.io/Termux-pkg-x)\n'
+            'TERMUX_REPO_DISTRIBUTION=(stable)\n'
+            'TERMUX_REPO_COMPONENT=(main)\n'
+        )
+
+        for var in ("TERMUX_REPO_URL", "TERMUX_REPO_DISTRIBUTION", "TERMUX_REPO_COMPONENT"):
+            s = re.sub(rf'^{var}=\([^)]*\)\n?', '', s, flags=re.MULTILINE)
+            s = re.sub(rf'^{var}=[^\n]*\n?', '', s, flags=re.MULTILINE)
+
+        s = s.replace("TERMUX_BUILD_TUPLE=", new_block + "TERMUX_BUILD_TUPLE=", 1)
+        p.write_text(s)
+        print(">>> Patched:", p)
+        PY
+
+        echo ">>> After patch:"
+        grep -nE '^TERMUX_REPO_(URL|DISTRIBUTION|COMPONENT)=' "$SETUP" || true
 
     - name: Patch termux_download_deb_pac.sh
       run: |
@@ -126,13 +157,7 @@ jobs:
       run: |
         mkdir -p ./artifacts ./debs
         touch ./debs/.placeholder
-
-        if [ "${{ github.event_name }}" != "workflow_dispatch" ]; then
-          if grep -qiP '^\s*%ci:no-build\s*$' <(git log --format="%B" -n 1 --no-merges "HEAD"); then
-            tar cf artifacts/debs-${{ matrix.target_arch }}.tar debs
-            echo "[!] %ci:no-build — exiting."; exit 0
-          fi
-        else
+        if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
           read -a PACKAGES <<< "${MANUAL_INPUT_PACKAGES//$'\n'/ }"
           repo_paths=$(jq --raw-output 'del(.pkg_format) | keys | .[]' repo.json)
           declare -a resolved=()
@@ -152,13 +177,6 @@ jobs:
           echo ">>> resolved ${#resolved[@]}: ${resolved[*]:-<none>}"
           [ "${#resolved[@]}" -eq 0 ] && { echo "::error::None found."; exit 1; }
         fi
-
-        declare -a packages=()
-        for repo_path in $(jq --raw-output 'del(.pkg_format) | keys | .[]' repo.json); do
-          repo=$(jq --raw-output '.["'${repo_path}'"].name' repo.json)
-          [ -f "./built_${repo}_packages.txt" ] && packages+=($(cat "./built_${repo}_packages.txt"))
-        done
-        echo "packages: ${packages[*]}"
 
     - name: Lint packages
       run: |
@@ -195,8 +213,6 @@ jobs:
           fi
         done
         PKGS_STR="${packages[*]}"
-        echo "packages: ${PKGS_STR}"
-
         if [[ "${#packages[@]}" -gt 0 ]]; then
           cat > /tmp/inner-build.sh <<'INNER_EOF'
         set -e
@@ -204,8 +220,6 @@ jobs:
         BUILD_ROOT=/home/builder/termux-packages
         cd "$BUILD_ROOT"
         mkdir -p "$PREFIX/var/lib/dpkg/info"
-        echo ">>> Building: __PKGS_PLACEHOLDER__"
-        cd "$BUILD_ROOT"
         ./build-package.sh -C -a aarch64 __PKGS_PLACEHOLDER__
         INNER_EOF
           sed -i "s|__PKGS_PLACEHOLDER__|${PKGS_STR}|g" /tmp/inner-build.sh
@@ -248,7 +262,6 @@ jobs:
     steps:
     - uses: actions/checkout@v6
       with: { fetch-depth: 1 }
-
     - uses: actions/download-artifact@v7
       with: { path: ./all-artifacts }
 
@@ -262,10 +275,7 @@ jobs:
         done
         count=$(find release-debs -type f -name '*.deb' | wc -l)
         echo ">>> found ${count} .deb files"
-        if [ "$count" -eq 0 ]; then
-          echo "::error::No .deb files found in artifacts"
-          exit 1
-        fi
+        [ "$count" -eq 0 ] && { echo "::error::No .deb files"; exit 1; }
 
     - name: Upload .deb files (serialized, with retries)
       run: |
@@ -281,19 +291,12 @@ jobs:
           for attempt in 1 2 3 4 5; do
             if gh release upload "$TAG" "$f" --clobber 2>/tmp/gh_err.log; then ok=1; break; fi
             if grep -qiE 'secondary rate limit|abuse|rate limit' /tmp/gh_err.log; then
-              backoff=$((attempt * 15)); echo; echo "  ↳ rate limited, sleep ${backoff}s"; sleep "$backoff"
+              backoff=$((attempt * 15)); sleep "$backoff"
             else
-              backoff=$((attempt * 3)); echo; echo "  ↳ retry in ${backoff}s"; cat /tmp/gh_err.log || true; sleep "$backoff"
+              backoff=$((attempt * 3)); cat /tmp/gh_err.log || true; sleep "$backoff"
             fi
           done
           if [ "$ok" -eq 1 ]; then echo ok; else echo "FAILED: $(basename "$f")"; failed=$((failed + 1)); fi
           sleep 1
         done
         [ "$failed" -gt 0 ] && { echo "::error::${failed}/${total} failed"; exit 1; }
-        echo ">>> all ${total} uploaded"
-
-    - name: Verify release assets
-      run: |
-        TAG="${{ needs.prepare-release.outputs.tag }}"
-        count=$(gh release view "$TAG" --json assets --jq '.assets | length')
-        echo ">>> release ${TAG} has ${count} assets"
