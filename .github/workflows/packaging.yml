@@ -11,6 +11,10 @@ on:
       packages:
         description: "Space-separated package names to build"
         required: false
+      bootstrap_url:
+        description: "URL of the bootstrap .tar.xz to seed the container's PREFIX (leave empty to skip)"
+        required: false
+        default: "https://github.com/xodiosx/Termux-pkg-x/releases/download/bootstrap-2026.10.09-140637/bootstrap-aarch64.tar.xz"
       free-space:
         type: boolean
         default: false
@@ -220,7 +224,10 @@ jobs:
           ' "$SETUP" > "$SETUP.new" && mv "$SETUP.new" "$SETUP"
         fi
 
-    - name: Configure dependency strategy
+    # =================================================================
+    # Force source builds of dependencies if use-repo-deps=false.
+    # =================================================================
+    - name: Configure dependency strategy (host side)
       env:
         USE_REPO_DEPS: ${{ github.event.inputs.use-repo-deps || 'false' }}
       run: |
@@ -309,21 +316,44 @@ jobs:
       run: ./scripts/run-docker.sh true
 
     # =================================================================
-    # NEW: configure the container's apt to use our repo, inside the
-    # container, in ONE step: rm sources.list, write ours, apt update.
-    # Only when use-repo-deps=true.
+    # Configure container apt via bootstrap extraction.
+    # Runs INSIDE the container as root, uses $PREFIX.
     # =================================================================
-    - name: Configure container apt (use-repo-deps)
+    - name: Configure container apt (download bootstrap, seed PREFIX, update)
       if: ${{ github.event.inputs.use-repo-deps == 'true' }}
+      env:
+        BOOTSTRAP_URL: ${{ github.event.inputs.bootstrap_url }}
       run: |
+        BOOTSTRAP_URL="${BOOTSTRAP_URL:-https://github.com/xodiosx/Termux-pkg-x/releases/download/bootstrap-2026.10.09-140637/bootstrap-aarch64.tar.xz}"
+        echo ">>> Bootstrap URL: $BOOTSTRAP_URL"
         ./scripts/run-docker.sh bash -c '
           set -e
-          rm -f /etc/apt/sources.list
-          rm -f /etc/apt/sources.list.d/*.list 2>/dev/null || true
-          echo "deb [trusted=yes] https://xodiosx.github.io/Termux-pkg-x stable main" > /etc/apt/sources.list
-          echo ">>> /etc/apt/sources.list:"
-          cat /etc/apt/sources.list
+          PREFIX=/data/data/app.xodos2/files/usr
+          export PREFIX
+
+          echo ">>> Downloading bootstrap..."
+          mkdir -p /tmp/bs
+          cd /tmp/bs
+          curl -L -o bootstrap.tar.xz "'"$BOOTSTRAP_URL"'" || { echo "Download failed"; exit 1; }
+          tar xf bootstrap.tar.xz || { echo "Extraction failed"; exit 1; }
+
+          echo ">>> Seeding $PREFIX from bootstrap..."
+          mkdir -p "$PREFIX"
+          cp -a /tmp/bs/. "$PREFIX/" || true
+          rm -rf /tmp/bs
+
+          echo ">>> Removing existing sources.list and apt lists..."
+          rm -f "$PREFIX/etc/apt/sources.list"
+          rm -f "$PREFIX/etc/apt/sources.list.d/*.list" 2>/dev/null || true
+          rm -rf "$PREFIX/var/lib/apt/lists/"* 2>/dev/null || true
+
+          echo ">>> Writing custom sources.list..."
+          echo "deb [trusted=yes] https://xodiosx.github.io/Termux-pkg-x stable main" > "$PREFIX/etc/apt/sources.list"
+
+          echo ">>> apt update..."
           apt update
+
+          echo ">>> done"
         '
 
     - name: Free additional disk space
@@ -449,7 +479,6 @@ jobs:
 
         if [ "${#ARCHIVES[@]}" -eq 0 ]; then
           echo "::error::No debs-*.tar files under all-artifacts/"
-          find all-artifacts -maxdepth 4 -type f || true
           exit 1
         fi
 
