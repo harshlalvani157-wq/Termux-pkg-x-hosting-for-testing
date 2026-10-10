@@ -11,10 +11,6 @@ on:
       packages:
         description: "Space-separated package names to build"
         required: false
-      bootstrap_url:
-        description: "URL of the bootstrap .tar.xz to seed the container's PREFIX (leave empty to skip)"
-        required: false
-        default: "https://github.com/xodiosx/Termux-pkg-x/releases/download/bootstrap-2026.10.09-140637/bootstrap-aarch64.tar.xz"
       free-space:
         type: boolean
         default: false
@@ -84,7 +80,6 @@ jobs:
             [ -d "$d" ] || continue
             p=$(basename "$d")
             if [ -d "packages/$p" ]; then
-              echo ">>> removing root-packages/$p (also in packages/)"
               rm -rf "root-packages/$p"
             fi
           done
@@ -185,9 +180,6 @@ jobs:
         echo "" >> "$TOOLS_BUILD"
         cat "$RAW" >> "$TOOLS_BUILD"
 
-        echo ">>> patch (^I = tab):"
-        cat -A "$RAW"
-
     - name: Patch apt package (custom repo + no keyring)
       run: |
         set -euo pipefail
@@ -225,9 +217,15 @@ jobs:
         fi
 
     # =================================================================
-    # Force source builds of dependencies if use-repo-deps=false.
+    # Dependency strategy:
+    #   use-repo-deps=true:
+    #     - leave termux_download_deb_pac.sh alone
+    #     - patch it to fetch Packages.gz (our repo has no .xz)
+    #   use-repo-deps=false:
+    #     - force source builds
+    # NO apt update anywhere — the container is Ubuntu, not Termux.
     # =================================================================
-    - name: Configure dependency strategy (host side)
+    - name: Configure dependency strategy
       env:
         USE_REPO_DEPS: ${{ github.event.inputs.use-repo-deps || 'false' }}
       run: |
@@ -238,8 +236,16 @@ jobs:
         [ -f "$TDP" ] || { echo "::error::$TDP not found"; exit 1; }
 
         if [ "$USE_REPO_DEPS" = "true" ]; then
-          echo ">>> Dependencies will be fetched from https://xodiosx.github.io/Termux-pkg-x"
-          echo ">>> termux_download_deb_pac.sh left untouched"
+          echo ">>> Dependencies fetched from https://xodiosx.github.io/Termux-pkg-x"
+          echo ">>> Patching termux_download_deb_pac.sh to use Packages.gz (we have no .xz)"
+
+          # Our repo publishes Packages.gz only (GH Pages corrupts .xz).
+          sed -i 's|Packages\.xz|Packages.gz|g' "$TDP"
+          sed -i 's|xz -d|gzip -d|g'             "$TDP"
+          sed -i 's|unxz|gunzip|g'               "$TDP"
+
+          echo ">>> relevant lines after patch:"
+          grep -nE 'Packages\.gz|gzip -d|gunzip' "$TDP" || true
         else
           echo ">>> Forcing source builds of all dependencies"
           if ! grep -q 'FORCED-BY-CI-FORCE-SOURCE-BUILD' "$TDP"; then
@@ -314,47 +320,6 @@ jobs:
 
     - name: Load Docker image
       run: ./scripts/run-docker.sh true
-
-    # =================================================================
-    # Configure container apt via bootstrap extraction.
-    # Runs INSIDE the container as root, uses $PREFIX.
-    # =================================================================
-    - name: Configure container apt (download bootstrap, seed PREFIX, update)
-      if: ${{ github.event.inputs.use-repo-deps == 'true' }}
-      env:
-        BOOTSTRAP_URL: ${{ github.event.inputs.bootstrap_url }}
-      run: |
-        BOOTSTRAP_URL="${BOOTSTRAP_URL:-https://github.com/xodiosx/Termux-pkg-x/releases/download/bootstrap-2026.10.09-140637/bootstrap-aarch64.tar.xz}"
-        echo ">>> Bootstrap URL: $BOOTSTRAP_URL"
-        ./scripts/run-docker.sh bash -c '
-          set -e
-          PREFIX=/data/data/app.xodos2/files/usr
-          export PREFIX
-
-          echo ">>> Downloading bootstrap..."
-          mkdir -p /tmp/bs
-          cd /tmp/bs
-          curl -L -o bootstrap.tar.xz "'"$BOOTSTRAP_URL"'" || { echo "Download failed"; exit 1; }
-          tar xf bootstrap.tar.xz || { echo "Extraction failed"; exit 1; }
-
-          echo ">>> Seeding $PREFIX from bootstrap..."
-          mkdir -p "$PREFIX"
-          cp -a /tmp/bs/. "$PREFIX/" || true
-          rm -rf /tmp/bs
-
-          echo ">>> Removing existing sources.list and apt lists..."
-          rm -f "$PREFIX/etc/apt/sources.list"
-          rm -f "$PREFIX/etc/apt/sources.list.d/*.list" 2>/dev/null || true
-          rm -rf "$PREFIX/var/lib/apt/lists/"* 2>/dev/null || true
-
-          echo ">>> Writing custom sources.list..."
-          echo "deb [trusted=yes] https://xodiosx.github.io/Termux-pkg-x stable main" > "$PREFIX/etc/apt/sources.list"
-
-          echo ">>> apt update..."
-          apt update
-
-          echo ">>> done"
-        '
 
     - name: Free additional disk space
       if: ${{ steps.build-info.outputs.free-space == 'true' }}
@@ -443,9 +408,7 @@ jobs:
 
         n=$(find debs -type f -name '*.deb' 2>/dev/null | wc -l)
         echo ">>> debs/ contains: ${n} .deb files"
-
         tar cf "artifacts/debs-${{ matrix.target_arch }}-${{ github.sha }}.tar" debs
-        tar tf "artifacts/debs-${{ matrix.target_arch }}-${{ github.sha }}.tar" | head -20 || true
 
     - name: Store *.deb files
       if: always()
@@ -465,7 +428,6 @@ jobs:
     steps:
     - uses: actions/checkout@v6
       with: { fetch-depth: 1 }
-
     - uses: actions/download-artifact@v6
       with: { path: ./all-artifacts }
 
@@ -476,7 +438,6 @@ jobs:
 
         mapfile -t ARCHIVES < <(find all-artifacts -type f -name 'debs-*.tar' 2>/dev/null || true)
         echo ">>> found ${#ARCHIVES[@]} tar archive(s)"
-
         if [ "${#ARCHIVES[@]}" -eq 0 ]; then
           echo "::error::No debs-*.tar files under all-artifacts/"
           exit 1
@@ -506,10 +467,7 @@ jobs:
           printf '[%d/%d] %s ... ' "$i" "$total" "$(basename "$f")"
           ok=0
           for attempt in 1 2 3 4 5; do
-            if gh release upload "$TAG" "$f" --clobber 2>/tmp/gh_err.log; then
-              ok=1
-              break
-            fi
+            if gh release upload "$TAG" "$f" --clobber 2>/tmp/gh_err.log; then ok=1; break; fi
             if grep -qiE 'secondary rate limit|abuse|rate limit' /tmp/gh_err.log; then
               backoff=$((attempt * 15))
             else
