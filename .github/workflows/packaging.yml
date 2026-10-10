@@ -104,14 +104,6 @@ jobs:
         xargs -0 -r -n50 sed -i 's/com\.termux/app.xodos2/g'
         grep -nE '^TERMUX_APP__PACKAGE_NAME=' scripts/properties.sh || true
 
-    # =================================================================
-    # Patch termux-tools:
-    #   - Wipe mirrors/ entirely, put ONE file (default) with our URL.
-    #   - Remove termux-change-repo (nothing to change).
-    #   - Replace pkg with a wrapper that ignores the mirror system.
-    # All shell uses tabs (Termux lint requires it), so we write the
-    # patch with 2-space indentation and convert to tabs via awk.
-    # =================================================================
     - name: Patch termux-tools for custom repo (tab-indented)
       run: |
         set -euo pipefail
@@ -163,9 +155,6 @@ jobs:
           hold|unhold) exec apt-mark "$CMD" "$@" ;;
           ""|help|-h|--help)
             echo "Usage: pkg <command> [args]"
-            echo "Commands: up upgrade full-upgrade install reinstall remove"
-            echo "          purge autoremove clean list list-all list-installed"
-            echo "          list-upgradable search show files hold unhold"
             ;;
           *) echo "pkg: unknown command '$CMD'" >&2; exit 1 ;;
         esac
@@ -207,22 +196,9 @@ jobs:
         sed -i 's|deb https://packages-cf\.termux\.dev/apt/termux-main/ stable main|deb [trusted=yes] https://xodiosx.github.io/Termux-pkg-x stable main|g' "$APT_BUILD"
         sed -i 's|deb https://packages-cf\.termux\.dev/apt/termux-main stable main|deb [trusted=yes] https://xodiosx.github.io/Termux-pkg-x stable main|g'  "$APT_BUILD"
 
-    - name: Override repository URL (~/.termuxrc + setup variables)
+    - name: Override repository URL (setup variables)
       run: |
         set -euo pipefail
-        {
-          echo 'TERMUX_REPO_PACKAGE="app.xodos2"'
-          echo 'TERMUX_REPO_URL=('
-          echo '  https://xodiosx.github.io/Termux-pkg-x'
-          echo ')'
-          echo 'TERMUX_REPO_DISTRIBUTION=('
-          echo '  stable'
-          echo ')'
-          echo 'TERMUX_REPO_COMPONENT=('
-          echo '  main'
-          echo ')'
-        } > "$HOME/.termuxrc"
-
         SETUP="scripts/build/termux_step_setup_variables.sh"
         if [ -f "$SETUP" ]; then
           awk '
@@ -255,7 +231,8 @@ jobs:
         [ -f "$TDP" ] || { echo "::error::$TDP not found"; exit 1; }
 
         if [ "$USE_REPO_DEPS" = "true" ]; then
-          echo ">>> Dependencies fetched from https://xodiosx.github.io/Termux-pkg-x"
+          echo ">>> Dependencies will be fetched from https://xodiosx.github.io/Termux-pkg-x"
+          echo ">>> termux_download_deb_pac.sh left untouched"
         else
           echo ">>> Forcing source builds of all dependencies"
           if ! grep -q 'FORCED-BY-CI-FORCE-SOURCE-BUILD' "$TDP"; then
@@ -329,8 +306,25 @@ jobs:
         device_name: /dev/zram0
 
     - name: Load Docker image
-      if: ${{ steps.build-info.outputs.free-space == 'true' }}
       run: ./scripts/run-docker.sh true
+
+    # =================================================================
+    # NEW: configure the container's apt to use our repo, inside the
+    # container, in ONE step: rm sources.list, write ours, apt update.
+    # Only when use-repo-deps=true.
+    # =================================================================
+    - name: Configure container apt (use-repo-deps)
+      if: ${{ github.event.inputs.use-repo-deps == 'true' }}
+      run: |
+        ./scripts/run-docker.sh bash -c '
+          set -e
+          rm -f /etc/apt/sources.list
+          rm -f /etc/apt/sources.list.d/*.list 2>/dev/null || true
+          echo "deb [trusted=yes] https://xodiosx.github.io/Termux-pkg-x stable main" > /etc/apt/sources.list
+          echo ">>> /etc/apt/sources.list:"
+          cat /etc/apt/sources.list
+          apt update
+        '
 
     - name: Free additional disk space
       if: ${{ steps.build-info.outputs.free-space == 'true' }}
@@ -363,7 +357,6 @@ jobs:
           echo 'mkdir -p "$PREFIX/var/lib/dpkg/info"'
           echo 'cd "$BUILD_ROOT"'
           echo ''
-          echo 'echo ">>> wiping stale built-packages markers"'
           echo 'rm -rf /data/data/.built-packages 2>/dev/null || true'
           echo 'rm -rf /data/data/app.xodos2/.built-packages 2>/dev/null || true'
           echo 'rm -rf /data/data/app.xodos2/files/.built-packages 2>/dev/null || true'
@@ -451,9 +444,6 @@ jobs:
         set -euo pipefail
         mkdir -p release-debs
 
-        echo ">>> downloaded artifacts tree:"
-        find all-artifacts -maxdepth 4 -type f | head -40 || true
-
         mapfile -t ARCHIVES < <(find all-artifacts -type f -name 'debs-*.tar' 2>/dev/null || true)
         echo ">>> found ${#ARCHIVES[@]} tar archive(s)"
 
@@ -464,7 +454,6 @@ jobs:
         fi
 
         for archive in "${ARCHIVES[@]}"; do
-          echo ">>> extracting $archive"
           tar xf "$archive" -C release-debs
         done
 
@@ -472,7 +461,6 @@ jobs:
         echo ">>> found ${count} .deb files"
         if [ "$count" -eq 0 ]; then
           echo "::error::No .deb files found inside the extracted tars"
-          find release-debs -maxdepth 3 -type f | head -30 || true
           exit 1
         fi
 
